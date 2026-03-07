@@ -89,6 +89,10 @@ JA4 is only available when the **client** connection to Varnish is over
 
 1. The client is connecting over plain HTTP instead of HTTPS.
 2. Varnish is not listening with a TLS endpoint.
+3. The very first TLS connection after Varnish starts will not have a
+   JA4 fingerprint. The OpenSSL message callback is installed lazily on
+   the first request, so the Client Hello for that connection has
+   already been processed. All subsequent connections are captured.
 
 ## License
 
