@@ -1,0 +1,76 @@
+$Module ja4 3 "JA4 TLS Client Fingerprinting"
+
+DESCRIPTION
+===========
+
+The ``ja4`` vmod computes JA4 TLS client fingerprints from the raw Client
+Hello wire bytes, not from OpenSSL's parsed representation.  OpenSSL only
+exposes recognised extensions, which causes mismatches with reference
+implementations like Wireshark.  The raw wire parser keeps the full extension
+list and field order accurate.
+
+JA4 is defined by FoxIO and provides four variants controlled by two
+independent dimensions: sorted vs original wire order, and hashed (SHA-256
+truncated to 12 hex chars) vs raw (comma-separated hex).
+
+All functions can only be used in client context (e.g. ``vcl_recv``,
+``vcl_deliver``).
+
+Requires Varnish built with client-side TLS that exports ``VTLS_tls_ctx()``.
+
+The VMOD allocates its OpenSSL ex_data indices at VCL warm time.
+On the first request it installs its own message callback
+(``SSL_CTX_set_msg_callback``) on the ``SSL_CTX`` that owns the
+connection; all subsequent TLS connections on that context will have
+their Client Hello captured.  The very first connection after VCL load
+may return empty (the handshake completed before the callback was
+installed).
+
+Algorithm reference:
+https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+
+EXAMPLE
+=======
+
+::
+
+  import ja4;
+
+  sub vcl_recv {
+    set req.http.X-JA4 = ja4.ja4();
+  }
+
+API
+===
+
+$Event event
+$Function STRING ja4()
+$Restrict client
+
+Returns the JA4 fingerprint string (sorted, hashed) for the current client
+TLS connection, e.g. ``t13d1516h2_8daaf6152771_e5627efa2ab1``.  Ciphers and
+extensions are sorted numerically; SNI and ALPN extensions are excluded from
+the extension hash.  Returns empty if not in client context, no TLS, or
+Client Hello data is unavailable.
+
+$Function STRING ja4_r()
+$Restrict client
+
+Returns the JA4 raw fingerprint (sorted, unhashed).  Same sorting and
+filtering as ``ja4()`` but ciphers and extensions are presented as
+comma-separated 4-char lowercase hex values instead of being hashed.
+Useful for debugging and analysis.
+
+$Function STRING ja4_o()
+$Restrict client
+
+Returns the JA4 original-order fingerprint (unsorted, hashed).  Ciphers and
+extensions retain their wire order (SNI/ALPN kept in the extension list),
+then are SHA-256 hashed.
+
+$Function STRING ja4_ro()
+$Restrict client
+
+Returns the JA4 raw original-order fingerprint (unsorted, unhashed).  Ciphers
+and extensions retain their wire order and are presented as comma-separated
+hex values.  Most verbose form, useful for deep inspection.

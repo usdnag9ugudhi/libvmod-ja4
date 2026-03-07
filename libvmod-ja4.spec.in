@@ -1,0 +1,44 @@
+%global __debug_package	0
+%global __strip	true
+
+%global vmoddir	%{_libdir}/varnish/vmods
+%global vcldir	%{_datadir}/varnish/vcl
+
+Name:		@PACKAGE@
+Version:	@PACKAGE_VERSION@
+Release:	1%{?dist}
+Summary:	JA4 TLS Client Fingerprinting VMOD for Varnish
+
+License:	Unlicense
+URL:		https://github.com/usdnag9ugudhi/libvmod-ja4
+Source:		%{name}-%{version}.tar.gz
+
+BuildRequires:	pkgconfig(varnishapi) >= 7.5.0
+BuildRequires:	openssl-devel
+
+%description
+Varnish VMOD that computes JA4 TLS Client Hello fingerprints from raw
+wire bytes.
+
+%prep
+%setup -q
+
+%build
+%configure CFLAGS="%{optflags}" RST2MAN=:
+%make_build V=1
+
+%install
+%make_install
+rm -f %{buildroot}%{vmoddir}/*.la
+
+%check
+%make_build check
+
+%files
+%{_docdir}/%{name}/
+%{_mandir}/man*/*
+%{vmoddir}/libvmod_ja4.so
+
+%changelog
+* libvmod-ja4 maintainers - 0.1
+- Initial package
