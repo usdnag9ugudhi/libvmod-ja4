@@ -16,6 +16,8 @@ nodist_libvmod_ja4_la_SOURCES = \
 
 @BUILD_VMOD_JA4@
 
+DISTCLEANFILES = vmod_vcs_version.txt
+
 # Test suite
 
 AM_TESTS_ENVIRONMENT = \
