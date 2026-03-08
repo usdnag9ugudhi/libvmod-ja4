@@ -69,8 +69,13 @@ import ja4;
 
 sub vcl_recv {
     set req.http.X-JA4 = ja4.ja4();
+    set req.http.X-JA4-Debug = ja4.reason();
 }
 ```
+
+Use `ja4.reason()` to see why JA4 is empty: `no_tls` (no client TLS),
+`no_capture` (Client Hello not captured, e.g. first connection),
+`no_ex_data`, `parse_fail`, or empty when JA4 is available.
 
 Four variants are available, controlled by two independent dimensions
 (sorted vs original wire order, hashed vs raw):
@@ -92,6 +97,10 @@ JA4 is only available when the **client** connection to Varnish is over
    JA4 fingerprint. The OpenSSL message callback is installed lazily on
    the first request, so the Client Hello for that connection has
    already been processed. All subsequent connections are captured.
+
+3. Set `req.http.X-JA4-Debug = ja4.reason()` in `vcl_recv` and check
+   the response header to see the exact reason (`no_tls`, `no_capture`,
+   `no_ex_data`, `parse_fail`, or empty when JA4 is present).
 
 ## License
 

@@ -111,6 +111,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
 struct ja4_task_cache {
 	const char	*result[4];
 	unsigned	 computed;
+	const char	*reason;
 };
 
 static const void *ja4_cache_id = &ja4_cache_id;
@@ -295,8 +296,10 @@ ja4_compute(VRT_CTX, unsigned variant)
 
 	/* VTLS_tls_ctx() is const; SSL_get_ex_data() needs mutable. */
 	ssl = (SSL *)VTLS_tls_ctx(ctx);
-	if (ssl == NULL)
+	if (ssl == NULL) {
+		cache->reason = "no_tls";
 		goto done;
+	}
 	pthread_once(&ja4_once_ctrl, ja4_init_once);
 
 	/*
@@ -311,12 +314,15 @@ ja4_compute(VRT_CTX, unsigned variant)
 	}
 
 	if (ja4_ssl_ex_idx < 0) {
+		cache->reason = "no_ex_data";
 		VSLb(ctx->vsl, SLT_Debug, "ja4: ex_data not allocated");
 		goto done;
 	}
 	cap = SSL_get_ex_data(ssl, ja4_ssl_ex_idx);
-	if (cap == NULL)
+	if (cap == NULL) {
+		cache->reason = "no_capture";
 		goto done;
+	}
 
 	/* --- Parse Client Hello --- */
 	memset(&raw, 0, sizeof(raw));
@@ -491,9 +497,11 @@ ja4_compute(VRT_CTX, unsigned variant)
 	}
 	if (cache->result[variant] == NULL)
 		VSLb(ctx->vsl, SLT_Debug, "ja4: workspace overflow");
+	cache->reason = "";
 	goto done;
 
 parse_fail:
+	cache->reason = "parse_fail";
 	VSLb(ctx->vsl, SLT_Debug,
 	    "ja4: Client Hello parse failed (len=%zu)", cap->len);
 done:
@@ -527,4 +535,19 @@ vmod_ja4_ro(VRT_CTX)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 	return (ja4_compute(ctx, JA4_RO));
+}
+
+VCL_STRING
+vmod_reason(VRT_CTX)
+{
+	struct vmod_priv *task_priv;
+	struct ja4_task_cache *cache;
+
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+	(void)ja4_compute(ctx, JA4_MAIN);
+	task_priv = VRT_priv_task(ctx, ja4_cache_id);
+	if (task_priv == NULL || task_priv->priv == NULL)
+		return ("no_priv");
+	cache = task_priv->priv;
+	return (cache->reason != NULL ? cache->reason : "");
 }
