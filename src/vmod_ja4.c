@@ -45,12 +45,22 @@ const SSL *VTLS_tls_ctx(const struct vrt_ctx *ctx);
 	 ((c) >= 'A' && (c) <= 'Z') || \
 	 ((c) >= 'a' && (c) <= 'z'))
 #define CLIENT_HELLO_MAX_LEN 16384
+#define RAW_MAX_CIPHERS   128
+#define RAW_MAX_EXTS       64
+#define RAW_MAX_SIG_ALGS   64
+#define RAW_MAX_ALPN       64
 
-/* --- Client Hello capture via msg callback --- */
+/* --- Parsed Client Hello stored per connection --- */
 
-struct ja4_capture {
-	size_t		len;
-	unsigned char	buf[];
+struct ja4_parsed {
+	uint16_t	tls_version;
+	uint8_t		has_sni;
+	uint8_t		nciphers;
+	uint8_t		nexts;
+	uint8_t		nsigs;
+	char		alpn_first;
+	char		alpn_last;
+	uint16_t	data[];
 };
 
 static int ja4_ssl_ex_idx = -1;
@@ -74,25 +84,151 @@ ja4_init_once(void)
 	    NULL, NULL, NULL);
 }
 
+static inline uint16_t
+be16dec(const unsigned char *p)
+{
+	return ((uint16_t)p[0] << 8 | p[1]);
+}
+
+static char
+hex_low(unsigned x)
+{
+	return ("0123456789abcdef"[x & 0xf]);
+}
+
 static void
 ja4_msg_cb(int write_p, int version, int content_type,
     const void *buf, size_t len, SSL *ssl, void *arg)
 {
-	struct ja4_capture *cap;
+	const unsigned char *p = buf;
+	struct ja4_parsed *parsed;
+	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
+	uint16_t sigs[RAW_MAX_SIG_ALGS];
+	unsigned nciphers, nexts, nsigs;
+	uint16_t legacy_version, tls_version;
+	int has_sni;
+	char alpn_first, alpn_last;
+	size_t off, body_len, cslen, ext_len, ext_end, i, dsz;
 
 	(void)version; (void)arg;
 	if (write_p != 0 || content_type != SSL3_RT_HANDSHAKE ||
-	    len < 1 || ((const unsigned char *)buf)[0] != SSL3_MT_CLIENT_HELLO)
+	    len < 1 || p[0] != SSL3_MT_CLIENT_HELLO)
 		return;
 	if (len > CLIENT_HELLO_MAX_LEN || ja4_ssl_ex_idx < 0)
 		return;
-	cap = malloc(sizeof(*cap) + len);
-	if (cap == NULL)
+	if (len < 4)
 		return;
-	cap->len = len;
-	memcpy(cap->buf, buf, len);
+	body_len = (size_t)p[1] << 16 | (size_t)p[2] << 8 | p[3];
+	if (body_len > CLIENT_HELLO_MAX_LEN - 4 ||
+	    len < 4 + body_len || body_len < 2 + 32 + 1)
+		return;
+
+	off = 4;
+	legacy_version = be16dec(p + off);
+	off += 2 + 32;
+
+	if (off >= len) return;
+	off += 1 + (size_t)p[off];
+
+	if (off + 2 > len) return;
+	cslen = be16dec(p + off); off += 2;
+	if (off + cslen > len)
+		return;
+
+	nciphers = 0;
+	for (i = 0; i + 2 <= cslen; i += 2) {
+		uint16_t c = be16dec(p + off + i);
+		if (!IS_GREASE_TLS(c) && nciphers < RAW_MAX_CIPHERS)
+			ciphers[nciphers++] = c;
+	}
+	off += cslen;
+
+	if (off >= len) return;
+	off += 1 + (size_t)p[off];
+
+	if (off + 2 > len) return;
+	ext_len = be16dec(p + off); off += 2;
+	ext_end = off + ext_len;
+	if (ext_end > len)
+		return;
+
+	has_sni = 0;
+	nexts = nsigs = 0;
+	alpn_first = alpn_last = '0';
+	tls_version = legacy_version;
+
+	while (off + 4 <= ext_end) {
+		uint16_t etype = be16dec(p + off);
+		uint16_t elen  = be16dec(p + off + 2);
+		off += 4;
+		if (off + elen > ext_end)
+			break;
+
+		if (!IS_GREASE_TLS(etype) && nexts < RAW_MAX_EXTS)
+			exts[nexts++] = etype;
+
+		if (etype == TLSEXT_TYPE_server_name) {
+			has_sni = 1;
+		} else if (etype == TLSEXT_TYPE_signature_algorithms &&
+		    elen >= 2 && elen <= RAW_MAX_SIG_ALGS * 2 + 2) {
+			uint16_t salen = be16dec(p + off);
+			for (i = 2; i + 2 <= 2 + (size_t)salen &&
+			    i + 2 <= (size_t)elen; i += 2) {
+				uint16_t sa = be16dec(p + off + i);
+				if (!IS_GREASE_TLS(sa) &&
+				    nsigs < RAW_MAX_SIG_ALGS)
+					sigs[nsigs++] = sa;
+			}
+		} else if (etype == TLSEXT_TYPE_alpn &&
+		    elen >= 3 && elen <= RAW_MAX_ALPN) {
+			size_t ll = be16dec(p + off);
+			unsigned plen = p[off + 2];
+			const unsigned char *ap = p + off + 3;
+			if (plen > 0 && ll > 0 && plen <= ll - 1 &&
+			    3 + plen <= (size_t)elen) {
+				if (IS_ASCII_ALNUM(ap[0]) &&
+				    IS_ASCII_ALNUM(ap[plen - 1])) {
+					alpn_first = (char)ap[0];
+					alpn_last  = (char)ap[plen - 1];
+				} else {
+					alpn_first = hex_low(ap[0] >> 4);
+					alpn_last  = hex_low(ap[plen - 1]);
+				}
+			}
+		} else if (etype == TLSEXT_TYPE_supported_versions &&
+		    elen >= 2 && elen <= 32) {
+			const unsigned char *sv = p + off;
+			uint16_t vmax = 0;
+			size_t svoff = (elen >= 3 &&
+			    (size_t)sv[0] == elen - 1) ? 1 : 0;
+			for (; svoff + 2 <= (size_t)elen; svoff += 2) {
+				uint16_t v = be16dec(sv + svoff);
+				if (!IS_GREASE_TLS(v) && v > vmax)
+					vmax = v;
+			}
+			if (vmax != 0)
+				tls_version = vmax;
+		}
+		off += elen;
+	}
+
+	dsz = ((size_t)nciphers + nexts + nsigs) * sizeof(uint16_t);
+	parsed = malloc(sizeof(*parsed) + dsz);
+	if (parsed == NULL)
+		return;
+	parsed->tls_version = tls_version;
+	parsed->has_sni = has_sni;
+	parsed->nciphers = (uint8_t)nciphers;
+	parsed->nexts = (uint8_t)nexts;
+	parsed->nsigs = (uint8_t)nsigs;
+	parsed->alpn_first = alpn_first;
+	parsed->alpn_last = alpn_last;
+	memcpy(parsed->data, ciphers, nciphers * sizeof(uint16_t));
+	memcpy(parsed->data + nciphers, exts, nexts * sizeof(uint16_t));
+	memcpy(parsed->data + nciphers + nexts, sigs,
+	    nsigs * sizeof(uint16_t));
 	free(SSL_get_ex_data(ssl, ja4_ssl_ex_idx));
-	SSL_set_ex_data(ssl, ja4_ssl_ex_idx, cap);
+	SSL_set_ex_data(ssl, ja4_ssl_ex_idx, parsed);
 }
 
 /* --- JA4 variant bits and per-request cache --- */
@@ -116,34 +252,6 @@ struct ja4_task_cache {
 
 static const void *ja4_cache_id = &ja4_cache_id;
 
-/* --- Raw Client Hello fields --- */
-
-#define RAW_MAX_CIPHERS   128
-#define RAW_MAX_EXTS       64
-#define RAW_MAX_SIG_ALGS   64
-#define RAW_MAX_ALPN       64
-
-struct raw_client_hello {
-	uint16_t	legacy_version;
-	int		has_sni;
-	unsigned char	ciphers[RAW_MAX_CIPHERS * 2];
-	size_t		cipher_len;
-	uint16_t	ext_types[RAW_MAX_EXTS];
-	size_t		ext_count;
-	unsigned char	sig_algs[RAW_MAX_SIG_ALGS * 2 + 2];
-	size_t		sig_algs_len;
-	unsigned char	supported_versions[32];
-	size_t		supported_versions_len;
-	unsigned char	alpn[RAW_MAX_ALPN];
-	size_t		alpn_len;
-};
-
-static inline uint16_t
-be16dec(const unsigned char *p)
-{
-	return ((uint16_t)p[0] << 8 | p[1]);
-}
-
 /* --- JA4 helpers --- */
 
 static int
@@ -153,79 +261,12 @@ cmp_uint16(const void *a, const void *b)
 	return ((x > y) - (x < y));
 }
 
-static char
-hex_low(unsigned x)
-{
-	return ("0123456789abcdef"[x & 0xf]);
-}
-
 static void
 uint16_to_hex(char *out, uint16_t v)
 {
 	out[0] = hex_low(v >> 12); out[1] = hex_low(v >> 8);
 	out[2] = hex_low(v >> 4);  out[3] = hex_low(v);
 	out[4] = '\0';
-}
-
-static int
-hash_hex_list(EVP_MD_CTX *md_ctx, const uint16_t *a, unsigned n)
-{
-	char hex[5];
-	unsigned i;
-
-	for (i = 0; i < n; i++) {
-		if (i > 0 && EVP_DigestUpdate(md_ctx, ",", 1) != 1)
-			return (-1);
-		uint16_to_hex(hex, a[i]);
-		if (EVP_DigestUpdate(md_ctx, hex, 4) != 1)
-			return (-1);
-	}
-	return (0);
-}
-
-/*
- * SHA-256 of one or two comma-separated hex-uint16 lists joined
- * by underscore, truncated to 12 hex chars.
- */
-static void
-ja4_hash_lists(const uint16_t *a, unsigned na,
-    const uint16_t *b, unsigned nb, char out[JA4_HASH_BUF])
-{
-	EVP_MD_CTX *md_ctx;
-	unsigned char digest[32];
-	unsigned int dlen;
-	unsigned i;
-
-	if (na == 0 && nb == 0) {
-		memcpy(out, "000000000000", JA4_HASH_BUF);
-		return;
-	}
-	md_ctx = EVP_MD_CTX_new();
-	if (md_ctx == NULL)
-		goto fail;
-	if (EVP_DigestInit_ex(md_ctx, EVP_sha256(), NULL) != 1)
-		goto fail;
-	if (hash_hex_list(md_ctx, a, na) != 0)
-		goto fail;
-	if (nb > 0) {
-		if (na > 0 && EVP_DigestUpdate(md_ctx, "_", 1) != 1)
-			goto fail;
-		if (hash_hex_list(md_ctx, b, nb) != 0)
-			goto fail;
-	}
-	if (EVP_DigestFinal_ex(md_ctx, digest, &dlen) != 1 || dlen != 32)
-		goto fail;
-	EVP_MD_CTX_free(md_ctx);
-	for (i = 0; i < JA4_HASH_LEN / 2; i++) {
-		out[2 * i]     = hex_low(digest[i] >> 4);
-		out[2 * i + 1] = hex_low(digest[i]);
-	}
-	out[JA4_HASH_LEN] = '\0';
-	return;
-fail:
-	if (md_ctx != NULL)
-		EVP_MD_CTX_free(md_ctx);
-	memcpy(out, "000000000000", JA4_HASH_BUF);
 }
 
 static size_t
@@ -243,6 +284,40 @@ hex_list(char *buf, size_t sz, size_t off,
 		off += 4;
 	}
 	return (off);
+}
+
+/*
+ * SHA-256 of one or two comma-separated hex-uint16 lists joined
+ * by underscore, truncated to 12 hex chars.
+ */
+static void
+ja4_hash_lists(const uint16_t *a, unsigned na,
+    const uint16_t *b, unsigned nb, char out[JA4_HASH_BUF])
+{
+	char tmp[1536];
+	size_t off;
+	unsigned char digest[32];
+	unsigned i;
+
+	if (na == 0 && nb == 0) {
+		memcpy(out, "000000000000", JA4_HASH_BUF);
+		return;
+	}
+	off = hex_list(tmp, sizeof(tmp), 0, a, na);
+	if (nb > 0) {
+		if (na > 0 && off < sizeof(tmp))
+			tmp[off++] = '_';
+		off = hex_list(tmp, sizeof(tmp), off, b, nb);
+	}
+	if (EVP_Digest(tmp, off, digest, NULL, EVP_sha256(), NULL) != 1) {
+		memcpy(out, "000000000000", JA4_HASH_BUF);
+		return;
+	}
+	for (i = 0; i < JA4_HASH_LEN / 2; i++) {
+		out[2 * i]     = hex_low(digest[i] >> 4);
+		out[2 * i + 1] = hex_low(digest[i]);
+	}
+	out[JA4_HASH_LEN] = '\0';
 }
 
 /* --- VCL event handler --- */
@@ -265,18 +340,14 @@ ja4_compute(VRT_CTX, unsigned variant)
 	struct ja4_task_cache *cache;
 	SSL *ssl;
 	SSL_CTX *sctx;
-	struct ja4_capture *cap;
-	struct raw_client_hello raw;
+	struct ja4_parsed *parsed;
 	int do_sort = (variant & JA4_SORTED) != 0;
 	int do_hash = (variant & JA4_HASHED) != 0;
 	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
-	uint16_t sigs[RAW_MAX_SIG_ALGS];
-	unsigned nciphers, ext_total, nexts, nsigs;
+	const uint16_t *pexts, *sigs;
+	unsigned nciphers, nexts, nsigs, ext_total, i;
 	const char *ver;
 	char part_a[16];
-	uint16_t wire;
-	char alpn_first, alpn_last;
-	size_t i, off, body_len, cslen, ext_len, ext_end;
 
 	assert(variant < 4);
 
@@ -318,90 +389,30 @@ ja4_compute(VRT_CTX, unsigned variant)
 		VSLb(ctx->vsl, SLT_Debug, "ja4: ex_data not allocated");
 		goto done;
 	}
-	cap = SSL_get_ex_data(ssl, ja4_ssl_ex_idx);
-	if (cap == NULL) {
+	parsed = SSL_get_ex_data(ssl, ja4_ssl_ex_idx);
+	if (parsed == NULL) {
 		cache->reason = "no_capture";
 		goto done;
 	}
 
-	/* --- Parse Client Hello --- */
-	memset(&raw, 0, sizeof(raw));
-	if (cap->len < 4 || cap->len > CLIENT_HELLO_MAX_LEN ||
-	    cap->buf[0] != SSL3_MT_CLIENT_HELLO)
-		goto parse_fail;
-	body_len = (size_t)cap->buf[1] << 16 |
-	    (size_t)cap->buf[2] << 8 | cap->buf[3];
-	if (body_len > CLIENT_HELLO_MAX_LEN - 4 ||
-	    cap->len < 4 + body_len || body_len < 2 + 32 + 1)
-		goto parse_fail;
+	nciphers = parsed->nciphers;
+	memcpy(ciphers, parsed->data, nciphers * sizeof(uint16_t));
 
-	off = 4;
-	raw.legacy_version = be16dec(cap->buf + off);
-	off += 2 + 32;					/* version + random */
-
-	if (off >= cap->len) goto parse_fail;		/* session_id */
-	off += 1 + (size_t)cap->buf[off];
-
-	if (off + 2 > cap->len) goto parse_fail;	/* cipher_suites */
-	cslen = be16dec(cap->buf + off); off += 2;
-	if (cslen > sizeof(raw.ciphers) || off + cslen > cap->len)
-		goto parse_fail;
-	memcpy(raw.ciphers, cap->buf + off, cslen);
-	raw.cipher_len = cslen;
-	off += cslen;
-
-	if (off >= cap->len) goto parse_fail;		/* compression */
-	off += 1 + (size_t)cap->buf[off];
-
-	if (off + 2 > cap->len) goto parse_fail;	/* extensions */
-	ext_len = be16dec(cap->buf + off); off += 2;
-	ext_end = off + ext_len;
-	if (ext_end > cap->len)
-		goto parse_fail;
-
-	while (off + 4 <= ext_end) {
-		uint16_t etype = be16dec(cap->buf + off);
-		uint16_t elen  = be16dec(cap->buf + off + 2);
-		off += 4;
-		if (off + elen > ext_end)
-			break;
-		if (raw.ext_count < RAW_MAX_EXTS)
-			raw.ext_types[raw.ext_count++] = etype;
-		if (etype == TLSEXT_TYPE_server_name)
-			raw.has_sni = 1;
-		else if (etype == TLSEXT_TYPE_signature_algorithms &&
-		    elen >= 2 && elen <= sizeof(raw.sig_algs)) {
-			memcpy(raw.sig_algs, cap->buf + off, elen);
-			raw.sig_algs_len = elen;
-		} else if (etype == TLSEXT_TYPE_alpn &&
-		    elen >= 2 && elen <= sizeof(raw.alpn)) {
-			memcpy(raw.alpn, cap->buf + off, elen);
-			raw.alpn_len = elen;
-		} else if (etype == TLSEXT_TYPE_supported_versions &&
-		    elen >= 2 && elen <= sizeof(raw.supported_versions)) {
-			memcpy(raw.supported_versions, cap->buf + off, elen);
-			raw.supported_versions_len = elen;
-		}
-		off += elen;
+	pexts = parsed->data + nciphers;
+	ext_total = parsed->nexts;
+	nexts = 0;
+	for (i = 0; i < parsed->nexts; i++) {
+		if (do_sort && (pexts[i] == TLSEXT_TYPE_server_name ||
+		    pexts[i] == TLSEXT_TYPE_alpn))
+			continue;
+		if (nexts < RAW_MAX_EXTS)
+			exts[nexts++] = pexts[i];
 	}
 
-	/* --- TLS version: prefer supported_versions over legacy --- */
-	wire = raw.legacy_version;
-	if (raw.supported_versions_len >= 2) {
-		const unsigned char *sv = raw.supported_versions;
-		uint16_t vmax = 0;
-		off = (raw.supported_versions_len >= 3 &&
-		    (size_t)sv[0] == raw.supported_versions_len - 1)
-		    ? 1 : 0;
-		for (; off + 2 <= raw.supported_versions_len; off += 2) {
-			uint16_t v = be16dec(sv + off);
-			if (!IS_GREASE_TLS(v) && v > vmax)
-				vmax = v;
-		}
-		if (vmax != 0)
-			wire = vmax;
-	}
-	switch (wire) {
+	sigs = parsed->data + nciphers + parsed->nexts;
+	nsigs = parsed->nsigs;
+
+	switch (parsed->tls_version) {
 	case 0x0304: ver = "13"; break;
 	case 0x0303: ver = "12"; break;
 	case 0x0302: ver = "11"; break;
@@ -414,65 +425,17 @@ ja4_compute(VRT_CTX, unsigned variant)
 	default:     ver = "00"; break;
 	}
 
-	nciphers = 0;
-	for (i = 0; i + 2 <= raw.cipher_len; i += 2) {
-		uint16_t c = be16dec(raw.ciphers + i);
-		if (!IS_GREASE_TLS(c) && nciphers < RAW_MAX_CIPHERS)
-			ciphers[nciphers++] = c;
-	}
-
-	ext_total = nexts = 0;
-	for (i = 0; i < raw.ext_count; i++) {
-		uint16_t et = raw.ext_types[i];
-		if (IS_GREASE_TLS(et))
-			continue;
-		ext_total++;
-		if (do_sort && (et == TLSEXT_TYPE_server_name ||
-		    et == TLSEXT_TYPE_alpn))
-			continue;
-		if (nexts < RAW_MAX_EXTS)
-			exts[nexts++] = et;
-	}
-
-	alpn_first = alpn_last = '0';
-	if (raw.alpn_len >= 3) {
-		unsigned plen = raw.alpn[2];
-		const unsigned char *p = raw.alpn + 3;
-		size_t ll = be16dec(raw.alpn);
-		if (plen > 0 && ll > 0 && plen <= ll - 1 &&
-		    3 + plen <= raw.alpn_len) {
-			if (IS_ASCII_ALNUM(p[0]) &&
-			    IS_ASCII_ALNUM(p[plen - 1])) {
-				alpn_first = (char)p[0];
-				alpn_last  = (char)p[plen - 1];
-			} else {
-				alpn_first = hex_low(p[0] >> 4);
-				alpn_last = hex_low(p[plen - 1]);
-			}
-		}
-	}
-
 	snprintf(part_a, sizeof(part_a), "t%s%c%02u%02u%c%c",
-	    ver, raw.has_sni ? 'd' : 'i',
+	    ver, parsed->has_sni ? 'd' : 'i',
 	    JA4_CAP(nciphers), JA4_CAP(ext_total),
-	    alpn_first, alpn_last);
+	    parsed->alpn_first, parsed->alpn_last);
 
 	if (do_sort) {
 		if (nciphers > 1)
-			qsort(ciphers, nciphers, sizeof(uint16_t), cmp_uint16);
+			qsort(ciphers, nciphers, sizeof(uint16_t),
+			    cmp_uint16);
 		if (nexts > 1)
 			qsort(exts, nexts, sizeof(uint16_t), cmp_uint16);
-	}
-
-	nsigs = 0;
-	if (raw.sig_algs_len >= 2) {
-		uint16_t salen = be16dec(raw.sig_algs);
-		for (i = 2; i + 2 <= 2 + (size_t)salen &&
-		    i + 2 <= raw.sig_algs_len; i += 2) {
-			uint16_t sa = be16dec(raw.sig_algs + i);
-			if (!IS_GREASE_TLS(sa) && nsigs < RAW_MAX_SIG_ALGS)
-				sigs[nsigs++] = sa;
-		}
 	}
 
 	if (do_hash) {
@@ -483,7 +446,8 @@ ja4_compute(VRT_CTX, unsigned variant)
 		    "%s_%s_%s", part_a, ch, eh);
 	} else {
 		char buf[4096];
-		off = (size_t)snprintf(buf, sizeof(buf), "%s_", part_a);
+		size_t off = (size_t)snprintf(buf, sizeof(buf),
+		    "%s_", part_a);
 		off = hex_list(buf, sizeof(buf), off, ciphers, nciphers);
 		if (off + 1 < sizeof(buf))
 			buf[off++] = '_';
@@ -498,12 +462,7 @@ ja4_compute(VRT_CTX, unsigned variant)
 	if (cache->result[variant] == NULL)
 		VSLb(ctx->vsl, SLT_Debug, "ja4: workspace overflow");
 	cache->reason = "";
-	goto done;
 
-parse_fail:
-	cache->reason = "parse_fail";
-	VSLb(ctx->vsl, SLT_Debug,
-	    "ja4: Client Hello parse failed (len=%zu)", cap->len);
 done:
 	cache->computed |= (1u << variant);
 	return (cache->result[variant]);

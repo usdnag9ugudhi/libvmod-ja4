@@ -27,6 +27,7 @@ varnish v1 -arg "-A ${tmpdir}/vtls.cfg" -vcl+backend {
 		set resp.http.ja4_r = ja4.ja4_r();
 		set resp.http.ja4_o = ja4.ja4_o();
 		set resp.http.ja4_ro = ja4.ja4_ro();
+		set resp.http.ja4_reason = ja4.reason();
 	}
 } -start
 
@@ -41,7 +42,7 @@ client c1 {
 	tls_handshake
 	txreq
 	rxresp
-	expect resp.status == 200
+	expect resp.http.ja4_reason == "no_capture"
 } -run
 
 # Second request: the msg_callback is now installed, so raw Client
