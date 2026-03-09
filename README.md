@@ -38,20 +38,6 @@ export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 
 ## Installation
 
-### From a tarball
-
-To install this VMOD, run the following commands:
-
-```
-./configure
-make
-make check
-sudo make install
-```
-
-The `make check` step is optional but it's good to know whether the
-tests are passing on your platform.
-
 ### From the Git repository
 
 To install from Git, clone this repository and run:
