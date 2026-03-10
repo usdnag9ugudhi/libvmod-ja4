@@ -31,7 +31,7 @@ varnish v1 -arg "-A ${tmpdir}/vtls.cfg" -vcl+backend {
 	}
 } -start
 
-# Second request: the msg_callback is now installed, so raw Client
+# The msg_callback is now installed, so raw Client
 # Hello bytes are captured and JA4 fingerprints are available.
 #
 # JA4 variants: ja4 (hashed sorted), ja4_r (raw sorted),
