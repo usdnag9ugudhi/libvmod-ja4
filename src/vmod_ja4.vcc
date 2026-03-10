@@ -18,13 +18,12 @@ All functions can only be used in client context (e.g. ``vcl_recv``,
 
 Requires Varnish built with client-side TLS that exports ``VTLS_tls_ctx()``.
 
-The VMOD allocates its OpenSSL ex_data indices at VCL warm time.
-On the first request it installs its own message callback
-(``SSL_CTX_set_msg_callback``) on the ``SSL_CTX`` that owns the
-connection; all subsequent TLS connections on that context will have
-their Client Hello captured.  The very first connection after VCL load
-may return empty (the handshake completed before the callback was
-installed).
+At VCL warm time the VMOD registers an OpenSSL ``SSL_CTX`` ex_data
+index whose ``new_func`` callback installs ``SSL_CTX_set_msg_callback``
+automatically every time ``SSL_CTX_new()`` is called.  Because
+certificate contexts are created after the index is registered,
+all Client Hello messages are captured -- including the very first
+connection and any contexts created by later certificate rotation.
 
 Algorithm reference:
 https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md

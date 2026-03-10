@@ -31,27 +31,13 @@ varnish v1 -arg "-A ${tmpdir}/vtls.cfg" -vcl+backend {
 	}
 } -start
 
-# First request installs the msg_callback on the SSL_CTX.
-# The Client Hello for this connection was not captured (handshake
-# already completed before the callback existed), so JA4 is empty.
-client c1 {
-	tls_config {
-		version = TLSv1.3
-		ciphersuites = "TLS_AES_128_GCM_SHA256"
-	}
-	tls_handshake
-	txreq
-	rxresp
-	expect resp.http.ja4_reason == "no_capture"
-} -run
-
 # Second request: the msg_callback is now installed, so raw Client
 # Hello bytes are captured and JA4 fingerprints are available.
 #
 # JA4 variants: ja4 (hashed sorted), ja4_r (raw sorted),
 #               ja4_o (hashed original), ja4_ro (raw original)
 # Spec: https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
-client c2 {
+client c1 {
 	tls_config {
 		version = TLSv1.3
 		ciphersuites = "TLS_AES_128_GCM_SHA256"

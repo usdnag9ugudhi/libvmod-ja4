@@ -8,6 +8,9 @@
  * Parses raw Client Hello wire bytes via OpenSSL msg callback,
  * not OpenSSL's parsed representation (which drops unknown exts).
  * Requires Varnish with client-side TLS exporting VTLS_tls_ctx().
+ *
+ * Uses an SSL_CTX ex_data new_func callback so the msg callback is
+ * installed automatically at SSL_CTX_new() time -- no timing issues.
  */
 
 #include "config.h"
@@ -67,6 +70,8 @@ static int ja4_ssl_ex_idx = -1;
 static int ja4_ctx_ex_idx = -1;
 static pthread_once_t ja4_once_ctrl = PTHREAD_ONCE_INIT;
 
+static void ja4_msg_cb(int, int, int, const void *, size_t, SSL *, void *);
+
 static void
 ja4_ex_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
     int idx, long argl, void *argp)
@@ -75,26 +80,30 @@ ja4_ex_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
 	free(ptr);
 }
 
+/*
+ * Called by OpenSSL each time SSL_CTX_new() creates a context.
+ * Installs our msg callback before any handshake can occur.
+ */
+static void
+ja4_ctx_new_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+    int idx, long argl, void *argp)
+{
+	(void)ptr; (void)ad; (void)idx; (void)argl; (void)argp;
+	SSL_CTX_set_msg_callback(parent, ja4_msg_cb);
+}
+
 static void
 ja4_init_once(void)
 {
 	ja4_ssl_ex_idx = SSL_get_ex_new_index(0, NULL,
 	    NULL, NULL, ja4_ex_free_cb);
 	ja4_ctx_ex_idx = SSL_CTX_get_ex_new_index(0, NULL,
-	    NULL, NULL, NULL);
+	    ja4_ctx_new_cb, NULL, NULL);
 }
 
-static inline uint16_t
-be16dec(const unsigned char *p)
-{
-	return ((uint16_t)p[0] << 8 | p[1]);
-}
-
-static char
-hex_low(unsigned x)
-{
-	return ("0123456789abcdef"[x & 0xf]);
-}
+#define BE16(p)    ((uint16_t)(p)[0] << 8 | (p)[1])
+#define HEX_LOW(x) ("0123456789abcdef"[(x) & 0xf])
+#define JA4_ZERO_HASH "000000000000"
 
 static void
 ja4_msg_cb(int write_p, int version, int content_type,
@@ -124,20 +133,20 @@ ja4_msg_cb(int write_p, int version, int content_type,
 		return;
 
 	off = 4;
-	legacy_version = be16dec(p + off);
+	legacy_version = BE16(p + off);
 	off += 2 + 32;
 
 	if (off >= len) return;
 	off += 1 + (size_t)p[off];
 
 	if (off + 2 > len) return;
-	cslen = be16dec(p + off); off += 2;
+	cslen = BE16(p + off); off += 2;
 	if (off + cslen > len)
 		return;
 
 	nciphers = 0;
 	for (i = 0; i + 2 <= cslen; i += 2) {
-		uint16_t c = be16dec(p + off + i);
+		uint16_t c = BE16(p + off + i);
 		if (!IS_GREASE_TLS(c) && nciphers < RAW_MAX_CIPHERS)
 			ciphers[nciphers++] = c;
 	}
@@ -147,7 +156,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	off += 1 + (size_t)p[off];
 
 	if (off + 2 > len) return;
-	ext_len = be16dec(p + off); off += 2;
+	ext_len = BE16(p + off); off += 2;
 	ext_end = off + ext_len;
 	if (ext_end > len)
 		return;
@@ -158,8 +167,8 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	tls_version = legacy_version;
 
 	while (off + 4 <= ext_end) {
-		uint16_t etype = be16dec(p + off);
-		uint16_t elen  = be16dec(p + off + 2);
+		uint16_t etype = BE16(p + off);
+		uint16_t elen  = BE16(p + off + 2);
 		off += 4;
 		if (off + elen > ext_end)
 			break;
@@ -171,17 +180,17 @@ ja4_msg_cb(int write_p, int version, int content_type,
 			has_sni = 1;
 		} else if (etype == TLSEXT_TYPE_signature_algorithms &&
 		    elen >= 2 && elen <= RAW_MAX_SIG_ALGS * 2 + 2) {
-			uint16_t salen = be16dec(p + off);
+			uint16_t salen = BE16(p + off);
 			for (i = 2; i + 2 <= 2 + (size_t)salen &&
 			    i + 2 <= (size_t)elen; i += 2) {
-				uint16_t sa = be16dec(p + off + i);
+				uint16_t sa = BE16(p + off + i);
 				if (!IS_GREASE_TLS(sa) &&
 				    nsigs < RAW_MAX_SIG_ALGS)
 					sigs[nsigs++] = sa;
 			}
 		} else if (etype == TLSEXT_TYPE_alpn &&
 		    elen >= 3 && elen <= RAW_MAX_ALPN) {
-			size_t ll = be16dec(p + off);
+			size_t ll = BE16(p + off);
 			unsigned plen = p[off + 2];
 			const unsigned char *ap = p + off + 3;
 			if (plen > 0 && ll > 0 && plen <= ll - 1 &&
@@ -191,8 +200,8 @@ ja4_msg_cb(int write_p, int version, int content_type,
 					alpn_first = (char)ap[0];
 					alpn_last  = (char)ap[plen - 1];
 				} else {
-					alpn_first = hex_low(ap[0] >> 4);
-					alpn_last  = hex_low(ap[plen - 1]);
+					alpn_first = HEX_LOW(ap[0] >> 4);
+					alpn_last  = HEX_LOW(ap[plen - 1]);
 				}
 			}
 		} else if (etype == TLSEXT_TYPE_supported_versions &&
@@ -202,7 +211,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
 			size_t svoff = (elen >= 3 &&
 			    (size_t)sv[0] == elen - 1) ? 1 : 0;
 			for (; svoff + 2 <= (size_t)elen; svoff += 2) {
-				uint16_t v = be16dec(sv + svoff);
+				uint16_t v = BE16(sv + svoff);
 				if (!IS_GREASE_TLS(v) && v > vmax)
 					vmax = v;
 			}
@@ -261,27 +270,19 @@ cmp_uint16(const void *a, const void *b)
 	return ((x > y) - (x < y));
 }
 
-static void
-uint16_to_hex(char *out, uint16_t v)
-{
-	out[0] = hex_low(v >> 12); out[1] = hex_low(v >> 8);
-	out[2] = hex_low(v >> 4);  out[3] = hex_low(v);
-	out[4] = '\0';
-}
-
 static size_t
 hex_list(char *buf, size_t sz, size_t off,
     const uint16_t *a, unsigned n)
 {
-	char hex[5];
 	unsigned i;
 
 	for (i = 0; i < n && off + 5 < sz; i++) {
 		if (i > 0)
 			buf[off++] = ',';
-		uint16_to_hex(hex, a[i]);
-		memcpy(buf + off, hex, 4);
-		off += 4;
+		buf[off++] = HEX_LOW(a[i] >> 12);
+		buf[off++] = HEX_LOW(a[i] >> 8);
+		buf[off++] = HEX_LOW(a[i] >> 4);
+		buf[off++] = HEX_LOW(a[i]);
 	}
 	return (off);
 }
@@ -300,7 +301,7 @@ ja4_hash_lists(const uint16_t *a, unsigned na,
 	unsigned i;
 
 	if (na == 0 && nb == 0) {
-		memcpy(out, "000000000000", JA4_HASH_BUF);
+		memcpy(out, JA4_ZERO_HASH, JA4_HASH_BUF);
 		return;
 	}
 	off = hex_list(tmp, sizeof(tmp), 0, a, na);
@@ -310,12 +311,12 @@ ja4_hash_lists(const uint16_t *a, unsigned na,
 		off = hex_list(tmp, sizeof(tmp), off, b, nb);
 	}
 	if (EVP_Digest(tmp, off, digest, NULL, EVP_sha256(), NULL) != 1) {
-		memcpy(out, "000000000000", JA4_HASH_BUF);
+		memcpy(out, JA4_ZERO_HASH, JA4_HASH_BUF);
 		return;
 	}
 	for (i = 0; i < JA4_HASH_LEN / 2; i++) {
-		out[2 * i]     = hex_low(digest[i] >> 4);
-		out[2 * i + 1] = hex_low(digest[i]);
+		out[2 * i]     = HEX_LOW(digest[i] >> 4);
+		out[2 * i + 1] = HEX_LOW(digest[i]);
 	}
 	out[JA4_HASH_LEN] = '\0';
 }
@@ -339,7 +340,6 @@ ja4_compute(VRT_CTX, unsigned variant)
 	struct vmod_priv *task_priv;
 	struct ja4_task_cache *cache;
 	SSL *ssl;
-	SSL_CTX *sctx;
 	struct ja4_parsed *parsed;
 	int do_sort = (variant & JA4_SORTED) != 0;
 	int do_hash = (variant & JA4_HASHED) != 0;
@@ -372,17 +372,6 @@ ja4_compute(VRT_CTX, unsigned variant)
 		goto done;
 	}
 	pthread_once(&ja4_once_ctrl, ja4_init_once);
-
-	/*
-	 * Install msg callback once per SSL_CTX.  Benign TOCTOU race:
-	 * concurrent workers setting the same pointer is idempotent.
-	 */
-	sctx = SSL_get_SSL_CTX(ssl);
-	if (sctx != NULL && ja4_ctx_ex_idx >= 0 &&
-	    SSL_CTX_get_ex_data(sctx, ja4_ctx_ex_idx) == NULL) {
-		SSL_CTX_set_msg_callback(sctx, ja4_msg_cb);
-		SSL_CTX_set_ex_data(sctx, ja4_ctx_ex_idx, (void *)1);
-	}
 
 	if (ja4_ssl_ex_idx < 0) {
 		cache->reason = "no_ex_data";
@@ -468,33 +457,16 @@ done:
 	return (cache->result[variant]);
 }
 
-VCL_STRING
-vmod_ja4(VRT_CTX)
-{
-	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
-	return (ja4_compute(ctx, JA4_MAIN));
+#define JA4_FUNC(name, variant)			\
+VCL_STRING vmod_##name(VRT_CTX) {		\
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);	\
+	return (ja4_compute(ctx, variant));	\
 }
 
-VCL_STRING
-vmod_ja4_r(VRT_CTX)
-{
-	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
-	return (ja4_compute(ctx, JA4_R));
-}
-
-VCL_STRING
-vmod_ja4_o(VRT_CTX)
-{
-	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
-	return (ja4_compute(ctx, JA4_O));
-}
-
-VCL_STRING
-vmod_ja4_ro(VRT_CTX)
-{
-	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
-	return (ja4_compute(ctx, JA4_RO));
-}
+JA4_FUNC(ja4,    JA4_MAIN)
+JA4_FUNC(ja4_r,  JA4_R)
+JA4_FUNC(ja4_o,  JA4_O)
+JA4_FUNC(ja4_ro, JA4_RO)
 
 VCL_STRING
 vmod_reason(VRT_CTX)
