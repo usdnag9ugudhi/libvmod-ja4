@@ -10,6 +10,10 @@ message callback, not OpenSSL's parsed representation. This keeps the
 full extension list and field order accurate, matching reference
 implementations like Wireshark.
 
+The message callback is installed automatically on every `SSL_CTX` via
+an OpenSSL ex\_data `new_func` hook, so all connections -- including the
+very first one after startup -- are captured.
+
 ## Requirements
 
 To build this VMOD you will need:
@@ -60,8 +64,8 @@ sub vcl_recv {
 ```
 
 Use `ja4.reason()` to see why JA4 is empty: `no_tls` (no client TLS),
-`no_capture` (Client Hello not captured, e.g. first connection),
-`no_ex_data`, `parse_fail`, or empty when JA4 is available.
+`no_capture` (Client Hello not captured), `no_ex_data`, or empty string
+when JA4 is available.
 
 Four variants are available, controlled by two independent dimensions
 (sorted vs original wire order, hashed vs raw):
@@ -79,12 +83,8 @@ JA4 is only available when the **client** connection to Varnish is over
 **TLS**. Common causes of an empty return value:
 
 1. The client is connecting over plain HTTP instead of HTTPS.
-2. The very first TLS connection after Varnish starts will not have a
-   JA4 fingerprint. The OpenSSL message callback is installed lazily on
-   the first request, so the Client Hello for that connection has
-   already been processed. All subsequent connections are captured.
-3. Use `ja4.reason()` to see the exact reason (`no_tls`, `no_capture`,
-   `no_ex_data`, `parse_fail`, or empty when JA4 is present).
+2. Use `ja4.reason()` to see the exact cause (`no_tls`, `no_capture`,
+   `no_ex_data`, or empty string when JA4 is present).
 
 ## License
 
