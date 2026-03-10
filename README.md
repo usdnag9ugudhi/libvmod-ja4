@@ -83,9 +83,7 @@ JA4 is only available when the **client** connection to Varnish is over
    JA4 fingerprint. The OpenSSL message callback is installed lazily on
    the first request, so the Client Hello for that connection has
    already been processed. All subsequent connections are captured.
-
-3. Set `req.http.X-JA4-Debug = ja4.reason()` in `vcl_recv` and check
-   the response header to see the exact reason (`no_tls`, `no_capture`,
+3. Use `ja4.reason()` to see the exact reason (`no_tls`, `no_capture`,
    `no_ex_data`, `parse_fail`, or empty when JA4 is present).
 
 ## License

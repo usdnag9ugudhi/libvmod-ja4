@@ -54,7 +54,6 @@ const SSL *VTLS_tls_ctx(const struct vrt_ctx *ctx);
 #define RAW_MAX_ALPN       64
 
 /* --- Parsed Client Hello stored per connection --- */
-
 struct ja4_parsed {
 	uint16_t	tls_version;
 	uint8_t		has_sni;
@@ -66,8 +65,8 @@ struct ja4_parsed {
 	uint16_t	data[];
 };
 
+/* --- OpenSSL ex_data and automatic callback installation --- */
 static int ja4_ssl_ex_idx = -1;
-static int ja4_ctx_ex_idx = -1;
 static pthread_once_t ja4_once_ctrl = PTHREAD_ONCE_INIT;
 
 static void ja4_msg_cb(int, int, int, const void *, size_t, SSL *, void *);
@@ -97,7 +96,7 @@ ja4_init_once(void)
 {
 	ja4_ssl_ex_idx = SSL_get_ex_new_index(0, NULL,
 	    NULL, NULL, ja4_ex_free_cb);
-	ja4_ctx_ex_idx = SSL_CTX_get_ex_new_index(0, NULL,
+	(void)SSL_CTX_get_ex_new_index(0, NULL,
 	    ja4_ctx_new_cb, NULL, NULL);
 }
 
@@ -105,6 +104,7 @@ ja4_init_once(void)
 #define HEX_LOW(x) ("0123456789abcdef"[(x) & 0xf])
 #define JA4_ZERO_HASH "000000000000"
 
+/* --- Client Hello parser (msg callback) --- */
 static void
 ja4_msg_cb(int write_p, int version, int content_type,
     const void *buf, size_t len, SSL *ssl, void *arg)
@@ -117,15 +117,12 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	uint16_t legacy_version, tls_version;
 	int has_sni;
 	char alpn_first, alpn_last;
-	size_t off, body_len, cslen, ext_len, ext_end, i, dsz;
+	size_t off, body_len, cslen, ext_len, ext_end, i;
 
 	(void)version; (void)arg;
 	if (write_p != 0 || content_type != SSL3_RT_HANDSHAKE ||
-	    len < 1 || p[0] != SSL3_MT_CLIENT_HELLO)
-		return;
-	if (len > CLIENT_HELLO_MAX_LEN || ja4_ssl_ex_idx < 0)
-		return;
-	if (len < 4)
+	    len < 4 || len > CLIENT_HELLO_MAX_LEN ||
+	    p[0] != SSL3_MT_CLIENT_HELLO)
 		return;
 	body_len = (size_t)p[1] << 16 | (size_t)p[2] << 8 | p[3];
 	if (body_len > CLIENT_HELLO_MAX_LEN - 4 ||
@@ -221,8 +218,8 @@ ja4_msg_cb(int write_p, int version, int content_type,
 		off += elen;
 	}
 
-	dsz = ((size_t)nciphers + nexts + nsigs) * sizeof(uint16_t);
-	parsed = malloc(sizeof(*parsed) + dsz);
+	parsed = malloc(sizeof(*parsed) +
+	    ((size_t)nciphers + nexts + nsigs) * sizeof(uint16_t));
 	if (parsed == NULL)
 		return;
 	parsed->tls_version = tls_version;
@@ -241,7 +238,6 @@ ja4_msg_cb(int write_p, int version, int content_type,
 }
 
 /* --- JA4 variant bits and per-request cache --- */
-
 #define JA4_SORTED   0x01u
 #define JA4_HASHED   0x02u
 #define JA4_MAIN     (JA4_SORTED | JA4_HASHED)
@@ -250,8 +246,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
 #define JA4_RO       0u
 #define JA4_HASH_LEN    12
 #define JA4_HASH_BUF    13
-#define JA4_COUNT_CAP   99
-#define JA4_CAP(x) ((x) > JA4_COUNT_CAP ? JA4_COUNT_CAP : (unsigned)(x))
+#define JA4_CAP(x) ((x) > 99 ? 99 : (unsigned)(x))
 
 struct ja4_task_cache {
 	const char	*result[4];
@@ -262,7 +257,6 @@ struct ja4_task_cache {
 static const void *ja4_cache_id = &ja4_cache_id;
 
 /* --- JA4 helpers --- */
-
 static int
 cmp_uint16(const void *a, const void *b)
 {
@@ -322,7 +316,6 @@ ja4_hash_lists(const uint16_t *a, unsigned na,
 }
 
 /* --- VCL event handler --- */
-
 int
 vmod_event(VRT_CTX, struct vmod_priv *priv, enum vcl_event_e e)
 {
@@ -333,7 +326,6 @@ vmod_event(VRT_CTX, struct vmod_priv *priv, enum vcl_event_e e)
 }
 
 /* --- JA4 computation --- */
-
 static VCL_STRING
 ja4_compute(VRT_CTX, unsigned variant)
 {
@@ -371,7 +363,6 @@ ja4_compute(VRT_CTX, unsigned variant)
 		cache->reason = "no_tls";
 		goto done;
 	}
-	pthread_once(&ja4_once_ctrl, ja4_init_once);
 
 	if (ja4_ssl_ex_idx < 0) {
 		cache->reason = "no_ex_data";
@@ -457,6 +448,7 @@ done:
 	return (cache->result[variant]);
 }
 
+/* --- VCL entry points --- */
 #define JA4_FUNC(name, variant)			\
 VCL_STRING vmod_##name(VRT_CTX) {		\
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);	\
