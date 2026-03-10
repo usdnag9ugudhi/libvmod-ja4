@@ -19,7 +19,12 @@ server s1 {
 	txresp
 } -start
 
-varnish v1 -arg "-A ${tmpdir}/vtls.cfg" -vcl+backend {
+# TLS frontend (-A) plus plain HTTP listener so the same v1 can serve
+# both TLS client c1 and plain HTTP client c2 (no_tls) against backend s1.
+varnish v1 \
+	-arg "-A ${tmpdir}/vtls.cfg" \
+	-arg "-a http=${tmpdir}/v1-http.sock,HTTP" \
+	-vcl+backend {
 	import ja4;
 
 	sub vcl_deliver {
@@ -49,4 +54,13 @@ client c1 {
 	expect resp.http.ja4_r ~ "^t13[di][0-9]{2}[0-9]{2}[0-9a-zA-Z]{2}_[0-9a-f,]+_[0-9a-f,]+(_[0-9a-f,]+)?$"
 	expect resp.http.ja4_o ~ "^t13[di][0-9]{2}[0-9]{2}[0-9a-zA-Z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$"
 	expect resp.http.ja4_ro ~ "^t13[di][0-9]{2}[0-9]{2}[0-9a-zA-Z]{2}_[0-9a-f,]+_[0-9a-f,]+(_[0-9a-f,]+)?$"
+	expect resp.http.ja4_reason == ""
+} -run
+
+# Plain HTTP to the same v1 (Unix socket listener): no client SSL context,
+# so ja4 is empty and ja4.reason() is no_tls. Backend remains s1.
+client c2 -connect ${tmpdir}/v1-http.sock {
+	txreq
+	rxresp
+	expect resp.http.ja4_reason == "no_tls"
 } -run
