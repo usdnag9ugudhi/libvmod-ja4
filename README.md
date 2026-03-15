@@ -59,13 +59,8 @@ import ja4;
 
 sub vcl_recv {
     set req.http.X-JA4 = ja4.ja4();
-    set req.http.X-JA4-Debug = ja4.reason();
 }
 ```
-
-Use `ja4.reason()` to see why JA4 is empty: `no_tls` (no client TLS),
-`no_capture` (Client Hello not captured), `no_ex_data`, or empty string
-when JA4 is available.
 
 Four variants are available, controlled by two independent dimensions
 (sorted vs original wire order, hashed vs raw):
@@ -80,11 +75,8 @@ Four variants are available, controlled by two independent dimensions
 ## Troubleshooting
 
 JA4 is only available when the **client** connection to Varnish is over
-**TLS**. Common causes of an empty return value:
-
-1. The client is connecting over plain HTTP instead of HTTPS.
-2. Use `ja4.reason()` to see the exact cause (`no_tls`, `no_capture`,
-   `no_ex_data`, or empty string when JA4 is present).
+**TLS**. A common cause of an empty return value is the client connecting
+over plain HTTP instead of HTTPS.
 
 ## License
 

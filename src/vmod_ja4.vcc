@@ -73,12 +73,3 @@ $Restrict client
 Returns the JA4 raw original-order fingerprint (unsorted, unhashed).  Ciphers
 and extensions retain their wire order and are presented as comma-separated
 hex values.  Most verbose form, useful for deep inspection.
-
-$Function STRING reason()
-$Restrict client
-
-Returns a short diagnostic when JA4 is empty: ``no_tls`` (no client TLS
-context), ``no_capture`` (Client Hello not captured, e.g. first connection),
-``no_ex_data`` (OpenSSL ex_data not available), ``parse_fail`` (Client Hello
-parse error), or empty when JA4 is available.  Set ``req.http.X-JA4-Debug =
-ja4.reason()`` in ``vcl_recv`` to troubleshoot blank JA4.
