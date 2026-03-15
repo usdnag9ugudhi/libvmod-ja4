@@ -466,12 +466,13 @@ ja4_compute(VRT_CTX, unsigned variant)
 		}
 		if (existing != NULL) {
 			conn_cache = (struct ja4_conn_cache *)existing;
-			if (SSL_get_ex_data(ssl, ja4_conn_cache_ex_idx) == NULL) {
-				if (SSL_set_ex_data(ssl, ja4_conn_cache_ex_idx,
-				    conn_cache) != 1) {
-					free(conn_cache);
-					conn_cache = NULL;
-				}
+			/* Always update ex_data so it holds the current pointer;
+			 * realloc may have moved the block, and the free callback
+			 * must not receive a stale (freed) pointer. */
+			if (SSL_set_ex_data(ssl, ja4_conn_cache_ex_idx,
+			    conn_cache) != 1) {
+				free(conn_cache);
+				conn_cache = NULL;
 			}
 			if (conn_cache != NULL) {
 				total = conn_cache->len[0] + conn_cache->len[1] +
