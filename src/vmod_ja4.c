@@ -155,6 +155,8 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	off += 2 + 32;
 
 	if (off >= len) return;
+	if ((size_t)p[off] > len - off - 1)
+		return;
 	off += 1 + (size_t)p[off];
 
 	if (off + 2 > len) return;
@@ -171,6 +173,8 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	off += cslen;
 
 	if (off >= len) return;
+	if ((size_t)p[off] > len - off - 1)
+		return;
 	off += 1 + (size_t)p[off];
 
 	if (off + 2 > len) return;
@@ -268,6 +272,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
 #define JA4_HASH_LEN    12
 #define JA4_HASH_BUF    13
 #define JA4_CAP(x) ((x) > 99 ? 99 : (unsigned)(x))
+#define JA4_CONN_CACHE_MAX  (4 * 4096)
 
 /* --- JA4 helpers --- */
 static int
@@ -367,6 +372,18 @@ ja4_compute(VRT_CTX, unsigned variant)
 	if (parsed == NULL)
 		return (NULL);
 
+	/* Clamp counts from parsed so we never overflow local buffers or
+	 * read past parsed->data (e.g. if ex_data was corrupted). */
+	nciphers = parsed->nciphers;
+	if (nciphers > RAW_MAX_CIPHERS)
+		nciphers = RAW_MAX_CIPHERS;
+	ext_total = parsed->nexts;
+	if (ext_total > RAW_MAX_EXTS)
+		ext_total = RAW_MAX_EXTS;
+	nsigs = parsed->nsigs;
+	if (nsigs > RAW_MAX_SIG_ALGS)
+		nsigs = RAW_MAX_SIG_ALGS;
+
 	/* Return cached result for this connection if already computed. */
 	if (ja4_conn_cache_ex_idx >= 0) {
 		size_t off;
@@ -376,19 +393,23 @@ ja4_compute(VRT_CTX, unsigned variant)
 		if (conn_cache != NULL &&
 		    (conn_cache->computed & (1u << variant))) {
 			off = 0;
-			for (j = 0; j < variant; j++)
+			for (j = 0; j < variant; j++) {
+				if (conn_cache->len[j] > 4096 ||
+				    off + conn_cache->len[j] > JA4_CONN_CACHE_MAX)
+					break;
 				off += conn_cache->len[j];
-			return (WS_Printf(ctx->ws, "%s", conn_cache->buf + off));
+			}
+			if (j == variant && off <= JA4_CONN_CACHE_MAX)
+				return (WS_Printf(ctx->ws, "%s",
+				    conn_cache->buf + off));
 		}
 	}
 
-	nciphers = parsed->nciphers;
 	memcpy(ciphers, parsed->data, nciphers * sizeof(uint16_t));
 
 	pexts = parsed->data + nciphers;
-	ext_total = parsed->nexts;
 	nexts = 0;
-	for (i = 0; i < parsed->nexts; i++) {
+	for (i = 0; i < ext_total; i++) {
 		if (do_sort && (pexts[i] == TLSEXT_TYPE_server_name ||
 		    pexts[i] == TLSEXT_TYPE_alpn))
 			continue;
@@ -396,8 +417,7 @@ ja4_compute(VRT_CTX, unsigned variant)
 			exts[nexts++] = pexts[i];
 	}
 
-	sigs = parsed->data + nciphers + parsed->nexts;
-	nsigs = parsed->nsigs;
+	sigs = parsed->data + nciphers + ext_total;
 
 	switch (parsed->tls_version) {
 	case 0x0304: ver = "13"; break;
@@ -458,6 +478,8 @@ ja4_compute(VRT_CTX, unsigned variant)
 		if (conn_cache != NULL) {
 			total = conn_cache->len[0] + conn_cache->len[1] +
 			    conn_cache->len[2] + conn_cache->len[3];
+			if (total > JA4_CONN_CACHE_MAX)
+				total = JA4_CONN_CACHE_MAX;
 			existing = realloc(conn_cache,
 			    sizeof(*conn_cache) + total + need);
 		} else {
@@ -477,6 +499,8 @@ ja4_compute(VRT_CTX, unsigned variant)
 			if (conn_cache != NULL) {
 				total = conn_cache->len[0] + conn_cache->len[1] +
 				    conn_cache->len[2] + conn_cache->len[3];
+				if (total > JA4_CONN_CACHE_MAX)
+					total = JA4_CONN_CACHE_MAX;
 				memcpy(conn_cache->buf + total, ret, need);
 				conn_cache->len[variant] = need;
 				conn_cache->computed |= (1u << variant);
