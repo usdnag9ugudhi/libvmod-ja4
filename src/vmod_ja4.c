@@ -137,14 +137,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
     const void *buf, size_t len, SSL *ssl, void *arg)
 {
 	const unsigned char *p = buf;
-	struct ja4_parsed *parsed;
-	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
-	uint16_t sigs[RAW_MAX_SIG_ALGS];
-	unsigned nciphers, nexts, nsigs;
-	uint16_t legacy_version, tls_version;
-	int has_sni;
-	char alpn_first, alpn_last;
-	size_t off, body_len, cslen, ext_len, ext_end, i;
+	size_t body_len;
 
 	(void)version; (void)arg;
 	if (write_p != 0 || content_type != SSL3_RT_HANDSHAKE ||
@@ -155,6 +148,16 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	if (body_len > CLIENT_HELLO_MAX_LEN - 4 ||
 	    len < 4 + body_len || body_len < 2 + 32 + 1)
 		return;
+
+	{
+	struct ja4_parsed *parsed;
+	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
+	uint16_t sigs[RAW_MAX_SIG_ALGS];
+	unsigned nciphers, nexts, nsigs;
+	uint16_t legacy_version, tls_version;
+	int has_sni;
+	char alpn_first, alpn_last;
+	size_t off, cslen, ext_len, ext_end, i;
 
 	off = 4;
 	legacy_version = BE16(p + off);
@@ -266,6 +269,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	    nsigs * sizeof(uint16_t));
 	free(SSL_get_ex_data(ssl, ja4_ssl_ex_idx));
 	SSL_set_ex_data(ssl, ja4_ssl_ex_idx, parsed);
+	}
 }
 
 /* --- JA4 variant bits and per-connection cache --- */
@@ -307,12 +311,14 @@ hex_list(char *buf, size_t sz, size_t off,
 /*
  * SHA-256 of one or two comma-separated hex-uint16 lists joined
  * by underscore, truncated to 12 hex chars.
+ * Max hex size: 5*na + (nb ? 1 + 5*nb : 0) - 1; na,nb <= 128 => 1281.
  */
+#define JA4_HEXLIST_MAX (5 * 128 + 1 + 5 * 128)
 static void
 ja4_hash_lists(const uint16_t *a, unsigned na,
     const uint16_t *b, unsigned nb, char out[JA4_HASH_BUF])
 {
-	char tmp[1536];
+	char tmp[JA4_HEXLIST_MAX];
 	size_t off;
 	unsigned char digest[32];
 	unsigned i;
@@ -321,11 +327,11 @@ ja4_hash_lists(const uint16_t *a, unsigned na,
 		memcpy(out, JA4_ZERO_HASH, JA4_HASH_BUF);
 		return;
 	}
-	off = hex_list(tmp, sizeof(tmp), 0, a, na);
+	off = hex_list(tmp, JA4_HEXLIST_MAX, 0, a, na);
 	if (nb > 0) {
-		if (na > 0 && off < sizeof(tmp))
+		if (na > 0 && off < JA4_HEXLIST_MAX)
 			tmp[off++] = '_';
-		off = hex_list(tmp, sizeof(tmp), off, b, nb);
+		off = hex_list(tmp, JA4_HEXLIST_MAX, off, b, nb);
 	}
 	if (EVP_Digest(tmp, off, digest, NULL, EVP_sha256(), NULL) != 1) {
 		memcpy(out, JA4_ZERO_HASH, JA4_HASH_BUF);
@@ -356,13 +362,6 @@ ja4_compute(VRT_CTX, unsigned variant)
 	SSL *ssl;
 	struct ja4_parsed *parsed;
 	const char *ret = NULL;
-	int do_sort = (variant & JA4_SORTED) != 0;
-	int do_hash = (variant & JA4_HASHED) != 0;
-	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
-	const uint16_t *pexts, *sigs;
-	unsigned nciphers, nexts, nsigs, ext_total, i;
-	const char *ver;
-	char part_a[16];
 
 	assert(variant < 4);
 
@@ -377,6 +376,25 @@ ja4_compute(VRT_CTX, unsigned variant)
 	if (parsed == NULL)
 		return (NULL);
 
+	/* Return cached result for this connection if already computed. */
+	if (ja4_conn_cache_ex_idx >= 0) {
+		conn_cache = SSL_get_ex_data(ssl, ja4_conn_cache_ex_idx);
+		if (conn_cache != NULL &&
+		    (conn_cache->computed & (1u << variant)) &&
+		    conn_cache->ptr[variant] != NULL)
+			return (WS_Printf(ctx->ws, "%s",
+			    conn_cache->ptr[variant]));
+	}
+
+	{
+	int do_sort = (variant & JA4_SORTED) != 0;
+	int do_hash = (variant & JA4_HASHED) != 0;
+	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
+	const uint16_t *pexts, *sigs;
+	unsigned nciphers, nexts, nsigs, ext_total, i;
+	const char *ver;
+	char part_a[16];
+
 	/* Clamp counts from parsed so we never overflow local buffers or
 	 * read past parsed->data (e.g. if ex_data was corrupted). */
 	nciphers = parsed->nciphers;
@@ -388,16 +406,6 @@ ja4_compute(VRT_CTX, unsigned variant)
 	nsigs = parsed->nsigs;
 	if (nsigs > RAW_MAX_SIG_ALGS)
 		nsigs = RAW_MAX_SIG_ALGS;
-
-	/* Return cached result for this connection if already computed. */
-	if (ja4_conn_cache_ex_idx >= 0) {
-		conn_cache = SSL_get_ex_data(ssl, ja4_conn_cache_ex_idx);
-		if (conn_cache != NULL &&
-		    (conn_cache->computed & (1u << variant)) &&
-		    conn_cache->ptr[variant] != NULL)
-			return (WS_Printf(ctx->ws, "%s",
-			    conn_cache->ptr[variant]));
-	}
 
 	memcpy(ciphers, parsed->data, nciphers * sizeof(uint16_t));
 
@@ -445,7 +453,8 @@ ja4_compute(VRT_CTX, unsigned variant)
 		ja4_hash_lists(exts, nexts, sigs, nsigs, eh);
 		ret = WS_Printf(ctx->ws, "%s_%s_%s", part_a, ch, eh);
 	} else {
-		char buf[4096];
+		/* part_a + "_" + hex(ciphers) + "_" + hex(exts) + "_" + hex(sigs) < 1300 */
+		char buf[1536];
 		size_t off = (size_t)snprintf(buf, sizeof(buf),
 		    "%s_", part_a);
 		off = hex_list(buf, sizeof(buf), off, ciphers, nciphers);
@@ -483,6 +492,7 @@ ja4_compute(VRT_CTX, unsigned variant)
 			conn_cache->ptr[variant] = cached;
 			conn_cache->computed |= (1u << variant);
 		}
+	}
 	}
 
 	return (ret);
