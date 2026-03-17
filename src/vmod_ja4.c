@@ -269,6 +269,9 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	    nsigs * sizeof(uint16_t));
 	free(SSL_get_ex_data(ssl, ja4_ssl_ex_idx));
 	SSL_set_ex_data(ssl, ja4_ssl_ex_idx, parsed);
+	memset(ciphers, 0, sizeof(ciphers));
+	memset(exts, 0, sizeof(exts));
+	memset(sigs, 0, sizeof(sigs));
 	}
 }
 
@@ -342,6 +345,8 @@ ja4_hash_lists(const uint16_t *a, unsigned na,
 		out[2 * i + 1] = HEX_LOW(digest[i]);
 	}
 	out[JA4_HASH_LEN] = '\0';
+	memset(tmp, 0, sizeof(tmp));
+	memset(digest, 0, sizeof(digest));
 }
 
 /* --- VCL event handler --- */
@@ -452,6 +457,8 @@ ja4_compute(VRT_CTX, unsigned variant)
 		ja4_hash_lists(ciphers, nciphers, NULL, 0, ch);
 		ja4_hash_lists(exts, nexts, sigs, nsigs, eh);
 		ret = WS_Printf(ctx->ws, "%s_%s_%s", part_a, ch, eh);
+		memset(ch, 0, sizeof(ch));
+		memset(eh, 0, sizeof(eh));
 	} else {
 		/* part_a + "_" + hex(ciphers) + "_" + hex(exts) + "_" + hex(sigs) < 1300 */
 		char buf[1536];
@@ -467,9 +474,14 @@ ja4_compute(VRT_CTX, unsigned variant)
 		}
 		buf[off] = '\0';
 		ret = WS_Printf(ctx->ws, "%s", buf);
+		memset(buf, 0, sizeof(buf));
 	}
 	if (ret == NULL)
 		VSLb(ctx->vsl, SLT_Debug, "ja4: workspace overflow");
+
+	memset(ciphers, 0, sizeof(ciphers));
+	memset(exts, 0, sizeof(exts));
+	memset(part_a, 0, sizeof(part_a));
 
 	/* Store in connection-level cache for reuse on same TLS connection. */
 	if (ja4_conn_cache_ex_idx >= 0 && ret != NULL) {
