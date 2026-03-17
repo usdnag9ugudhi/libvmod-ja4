@@ -80,22 +80,28 @@ ja4_ex_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
 	free(ptr);
 }
 
-/*
- * Connection-level cache: one allocation for all variant strings.
- * Strings are stored back-to-back in buf[]; len[i] is length including \0.
- */
 struct ja4_conn_cache {
 	unsigned	 computed;
-	size_t		len[4];
-	char		buf[];
+	const char	*ptr[4];
 };
 
 static void
 ja4_conn_cache_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
     int idx, long argl, void *argp)
 {
+	struct ja4_conn_cache *conn_cache;
+	unsigned i;
+
 	(void)parent; (void)ad; (void)idx; (void)argl; (void)argp;
-	free(ptr);
+	conn_cache = ptr;
+	if (conn_cache == NULL)
+		return;
+	for (i = 0; i < 4; i++) {
+		if ((conn_cache->computed & (1u << i)) != 0 &&
+		    conn_cache->ptr[i] != NULL)
+			free((void *)conn_cache->ptr[i]);
+	}
+	free(conn_cache);
 }
 
 /*
@@ -272,7 +278,6 @@ ja4_msg_cb(int write_p, int version, int content_type,
 #define JA4_HASH_LEN    12
 #define JA4_HASH_BUF    13
 #define JA4_CAP(x) ((x) > 99 ? 99 : (unsigned)(x))
-#define JA4_CONN_CACHE_MAX  (4 * 4096)
 
 /* --- JA4 helpers --- */
 static int
@@ -386,23 +391,12 @@ ja4_compute(VRT_CTX, unsigned variant)
 
 	/* Return cached result for this connection if already computed. */
 	if (ja4_conn_cache_ex_idx >= 0) {
-		size_t off;
-		unsigned j;
-
 		conn_cache = SSL_get_ex_data(ssl, ja4_conn_cache_ex_idx);
 		if (conn_cache != NULL &&
-		    (conn_cache->computed & (1u << variant))) {
-			off = 0;
-			for (j = 0; j < variant; j++) {
-				if (conn_cache->len[j] > 4096 ||
-				    off + conn_cache->len[j] > JA4_CONN_CACHE_MAX)
-					break;
-				off += conn_cache->len[j];
-			}
-			if (j == variant && off <= JA4_CONN_CACHE_MAX)
-				return (WS_Printf(ctx->ws, "%s",
-				    conn_cache->buf + off));
-		}
+		    (conn_cache->computed & (1u << variant)) &&
+		    conn_cache->ptr[variant] != NULL)
+			return (WS_Printf(ctx->ws, "%s",
+			    conn_cache->ptr[variant]));
 	}
 
 	memcpy(ciphers, parsed->data, nciphers * sizeof(uint16_t));
@@ -470,41 +464,24 @@ ja4_compute(VRT_CTX, unsigned variant)
 
 	/* Store in connection-level cache for reuse on same TLS connection. */
 	if (ja4_conn_cache_ex_idx >= 0 && ret != NULL) {
-		size_t need, total;
-		const char *existing;
+		char *cached;
 
 		conn_cache = SSL_get_ex_data(ssl, ja4_conn_cache_ex_idx);
-		need = strlen(ret) + 1;
-		if (conn_cache != NULL) {
-			total = conn_cache->len[0] + conn_cache->len[1] +
-			    conn_cache->len[2] + conn_cache->len[3];
-			if (total > JA4_CONN_CACHE_MAX)
-				total = JA4_CONN_CACHE_MAX;
-			existing = realloc(conn_cache,
-			    sizeof(*conn_cache) + total + need);
-		} else {
-			total = 0;
-			existing = calloc(1, sizeof(*conn_cache) + need);
-		}
-		if (existing != NULL) {
-			conn_cache = (struct ja4_conn_cache *)existing;
-			/* Always update ex_data so it holds the current pointer;
-			 * realloc may have moved the block, and the free callback
-			 * must not receive a stale (freed) pointer. */
-			if (SSL_set_ex_data(ssl, ja4_conn_cache_ex_idx,
-			    conn_cache) != 1) {
-				free(conn_cache);
-				conn_cache = NULL;
+		cached = strdup(ret);
+		if (cached != NULL) {
+			if (conn_cache == NULL) {
+				conn_cache = calloc(1, sizeof(*conn_cache));
+				if (conn_cache == NULL || SSL_set_ex_data(ssl,
+				    ja4_conn_cache_ex_idx, conn_cache) != 1) {
+					free(conn_cache);
+					free(cached);
+					return (ret);
+				}
 			}
-			if (conn_cache != NULL) {
-				total = conn_cache->len[0] + conn_cache->len[1] +
-				    conn_cache->len[2] + conn_cache->len[3];
-				if (total > JA4_CONN_CACHE_MAX)
-					total = JA4_CONN_CACHE_MAX;
-				memcpy(conn_cache->buf + total, ret, need);
-				conn_cache->len[variant] = need;
-				conn_cache->computed |= (1u << variant);
-			}
+			if (conn_cache->ptr[variant] != NULL)
+				free((void *)conn_cache->ptr[variant]);
+			conn_cache->ptr[variant] = cached;
+			conn_cache->computed |= (1u << variant);
 		}
 	}
 
