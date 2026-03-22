@@ -40,5 +40,8 @@ rm -f %{buildroot}%{vmoddir}/*.la
 %{vmoddir}/libvmod_ja4.so
 
 %changelog
+* Sun Mar 22 2026 libvmod-ja4 maintainers - 1.0-1
+- Release 1.0
+
 * libvmod-ja4 maintainers - 0.1
 - Initial package
