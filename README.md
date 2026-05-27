@@ -48,9 +48,14 @@ To install from Git, clone this repository and run:
 
 ```
 ./bootstrap
+./configure
+make
+make check
+sudo make install
 ```
 
-And then follow the instructions above for installing from a tarball.
+The `make check` step is optional but it's good to know whether the
+tests are passing on your platform.
 
 ## Example
 
