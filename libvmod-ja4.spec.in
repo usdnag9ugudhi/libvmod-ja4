@@ -40,6 +40,10 @@ rm -f %{buildroot}%{vmoddir}/*.la
 %{vmoddir}/libvmod_ja4.so
 
 %changelog
+* Sat Sep 12 2026 libvmod-ja4 maintainers - 1.0.1-1
+- Unregister OpenSSL callbacks on the last vcl.discard, fixing a
+  crash after VCL reload (varnish/varnish#51)
+
 * Sun Mar 22 2026 libvmod-ja4 maintainers - 1.0-1
 - Release 1.0
 
