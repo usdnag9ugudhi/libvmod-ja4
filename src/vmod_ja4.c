@@ -66,9 +66,19 @@ struct ja4_parsed {
 };
 
 /* --- OpenSSL ex_data and automatic callback installation --- */
+/* ja4_mtx guards everything below. */
+static pthread_mutex_t ja4_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int ja4_ssl_ex_idx = -1;
 static int ja4_conn_cache_ex_idx = -1;
-static pthread_once_t ja4_once_ctrl = PTHREAD_ONCE_INIT;
+static int ja4_ctx_ex_idx = -1;
+static unsigned ja4_vcl_refs;
+static unsigned ja4_armed;
+
+struct ja4_ctx_ref {
+	SSL_CTX				*ctx;
+	VTAILQ_ENTRY(ja4_ctx_ref)	 list;
+};
+static VTAILQ_HEAD(, ja4_ctx_ref) ja4_ctxs = VTAILQ_HEAD_INITIALIZER(ja4_ctxs);
 
 static void ja4_msg_cb(int, int, int, const void *, size_t, SSL *, void *);
 
@@ -106,25 +116,97 @@ ja4_conn_cache_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
 
 /*
  * Called by OpenSSL each time SSL_CTX_new() creates a context.
- * Installs our msg callback before any handshake can occur.
+ * Installs our msg callback before any handshake can occur, and
+ * remembers the context so we can uninstall it again at unload.
  */
 static void
 ja4_ctx_new_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
     int idx, long argl, void *argp)
 {
+	struct ja4_ctx_ref *ref;
+
 	(void)ptr; (void)ad; (void)idx; (void)argl; (void)argp;
-	SSL_CTX_set_msg_callback(parent, ja4_msg_cb);
+
+	ref = malloc(sizeof(*ref));
+	if (ref == NULL)
+		return;
+	ref->ctx = parent;
+
+	AZ(pthread_mutex_lock(&ja4_mtx));
+	if (ja4_armed) {
+		SSL_CTX_set_msg_callback(parent, ja4_msg_cb);
+		VTAILQ_INSERT_TAIL(&ja4_ctxs, ref, list);
+		ref = NULL;
+	}
+	AZ(pthread_mutex_unlock(&ja4_mtx));
+	free(ref);
 }
 
+/* Called from SSL_CTX_free(), so we never keep a freed SSL_CTX. */
 static void
-ja4_init_once(void)
+ja4_ctx_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+    int idx, long argl, void *argp)
+{
+	struct ja4_ctx_ref *ref;
+
+	(void)ptr; (void)ad; (void)idx; (void)argl; (void)argp;
+
+	AZ(pthread_mutex_lock(&ja4_mtx));
+	VTAILQ_FOREACH(ref, &ja4_ctxs, list) {
+		if (ref->ctx == parent) {
+			VTAILQ_REMOVE(&ja4_ctxs, ref, list);
+			break;
+		}
+	}
+	AZ(pthread_mutex_unlock(&ja4_mtx));
+	free(ref);
+}
+
+/* Caller holds ja4_mtx. */
+static void
+ja4_global_init(void)
 {
 	ja4_ssl_ex_idx = SSL_get_ex_new_index(0, NULL,
 	    NULL, NULL, ja4_ex_free_cb);
 	ja4_conn_cache_ex_idx = SSL_get_ex_new_index(0, NULL,
 	    NULL, NULL, ja4_conn_cache_free_cb);
-	(void)SSL_CTX_get_ex_new_index(0, NULL,
-	    ja4_ctx_new_cb, NULL, NULL);
+	ja4_ctx_ex_idx = SSL_CTX_get_ex_new_index(0, NULL,
+	    ja4_ctx_new_cb, NULL, ja4_ctx_free_cb);
+	ja4_armed = 1;
+}
+
+/*
+ * Unregister everything before Varnish dlclose()s us.
+ * Caller holds ja4_mtx.
+ */
+static void
+ja4_global_fini(void)
+{
+	struct ja4_ctx_ref *ref, *tmp;
+
+	ja4_armed = 0;
+
+	VTAILQ_FOREACH_SAFE(ref, &ja4_ctxs, list, tmp) {
+		SSL_CTX_set_msg_callback(ref->ctx, NULL);
+		VTAILQ_REMOVE(&ja4_ctxs, ref, list);
+		free(ref);
+	}
+
+	if (ja4_ssl_ex_idx >= 0) {
+		(void)CRYPTO_free_ex_index(CRYPTO_EX_INDEX_SSL,
+		    ja4_ssl_ex_idx);
+		ja4_ssl_ex_idx = -1;
+	}
+	if (ja4_conn_cache_ex_idx >= 0) {
+		(void)CRYPTO_free_ex_index(CRYPTO_EX_INDEX_SSL,
+		    ja4_conn_cache_ex_idx);
+		ja4_conn_cache_ex_idx = -1;
+	}
+	if (ja4_ctx_ex_idx >= 0) {
+		(void)CRYPTO_free_ex_index(CRYPTO_EX_INDEX_SSL_CTX,
+		    ja4_ctx_ex_idx);
+		ja4_ctx_ex_idx = -1;
+	}
 }
 
 #define BE16(p)    ((uint16_t)(p)[0] << 8 | (p)[1])
@@ -138,8 +220,16 @@ ja4_msg_cb(int write_p, int version, int content_type,
 {
 	const unsigned char *p = buf;
 	size_t body_len;
+	unsigned armed;
 
 	(void)version; (void)arg;
+
+	AZ(pthread_mutex_lock(&ja4_mtx));
+	armed = ja4_armed;
+	AZ(pthread_mutex_unlock(&ja4_mtx));
+	if (!armed)
+		return;
+
 	if (write_p != 0 || content_type != SSL3_RT_HANDSHAKE ||
 	    len < 4 || len > CLIENT_HELLO_MAX_LEN ||
 	    p[0] != SSL3_MT_CLIENT_HELLO)
@@ -267,8 +357,14 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	memcpy(parsed->data + nciphers, exts, nexts * sizeof(uint16_t));
 	memcpy(parsed->data + nciphers + nexts, sigs,
 	    nsigs * sizeof(uint16_t));
-	free(SSL_get_ex_data(ssl, ja4_ssl_ex_idx));
-	SSL_set_ex_data(ssl, ja4_ssl_ex_idx, parsed);
+	AZ(pthread_mutex_lock(&ja4_mtx));
+	if (ja4_armed) {
+		free(SSL_get_ex_data(ssl, ja4_ssl_ex_idx));
+		SSL_set_ex_data(ssl, ja4_ssl_ex_idx, parsed);
+		parsed = NULL;
+	}
+	AZ(pthread_mutex_unlock(&ja4_mtx));
+	free(parsed);
 	memset(ciphers, 0, sizeof(ciphers));
 	memset(exts, 0, sizeof(exts));
 	memset(sigs, 0, sizeof(sigs));
@@ -354,8 +450,19 @@ int
 vmod_event(VRT_CTX, struct vmod_priv *priv, enum vcl_event_e e)
 {
 	(void)ctx; (void)priv;
-	if (e == VCL_EVENT_WARM)
-		pthread_once(&ja4_once_ctrl, ja4_init_once);
+
+	if (e == VCL_EVENT_LOAD) {
+		AZ(pthread_mutex_lock(&ja4_mtx));
+		if (ja4_vcl_refs++ == 0)
+			ja4_global_init();
+		AZ(pthread_mutex_unlock(&ja4_mtx));
+	} else if (e == VCL_EVENT_DISCARD) {
+		AZ(pthread_mutex_lock(&ja4_mtx));
+		assert(ja4_vcl_refs > 0);
+		if (--ja4_vcl_refs == 0)
+			ja4_global_fini();
+		AZ(pthread_mutex_unlock(&ja4_mtx));
+	}
 	return (0);
 }
 
@@ -367,23 +474,30 @@ ja4_compute(VRT_CTX, unsigned variant)
 	SSL *ssl;
 	struct ja4_parsed *parsed;
 	const char *ret = NULL;
+	int ssl_idx, cache_idx;
 
 	assert(variant < 4);
 
 	ssl = (SSL *)VTLS_tls_ctx(ctx);
 	if (ssl == NULL)
 		return (NULL);
-	if (ja4_ssl_ex_idx < 0) {
+
+	AZ(pthread_mutex_lock(&ja4_mtx));
+	ssl_idx = ja4_armed ? ja4_ssl_ex_idx : -1;
+	cache_idx = ja4_armed ? ja4_conn_cache_ex_idx : -1;
+	AZ(pthread_mutex_unlock(&ja4_mtx));
+
+	if (ssl_idx < 0) {
 		VSLb(ctx->vsl, SLT_Debug, "ja4: ex_data not allocated");
 		return (NULL);
 	}
-	parsed = SSL_get_ex_data(ssl, ja4_ssl_ex_idx);
+	parsed = SSL_get_ex_data(ssl, ssl_idx);
 	if (parsed == NULL)
 		return (NULL);
 
 	/* Return cached result for this connection if already computed. */
-	if (ja4_conn_cache_ex_idx >= 0) {
-		conn_cache = SSL_get_ex_data(ssl, ja4_conn_cache_ex_idx);
+	if (cache_idx >= 0) {
+		conn_cache = SSL_get_ex_data(ssl, cache_idx);
 		if (conn_cache != NULL &&
 		    (conn_cache->computed & (1u << variant)) &&
 		    conn_cache->ptr[variant] != NULL)
@@ -484,16 +598,16 @@ ja4_compute(VRT_CTX, unsigned variant)
 	memset(part_a, 0, sizeof(part_a));
 
 	/* Store in connection-level cache for reuse on same TLS connection. */
-	if (ja4_conn_cache_ex_idx >= 0 && ret != NULL) {
+	if (cache_idx >= 0 && ret != NULL) {
 		char *cached;
 
-		conn_cache = SSL_get_ex_data(ssl, ja4_conn_cache_ex_idx);
+		conn_cache = SSL_get_ex_data(ssl, cache_idx);
 		cached = strdup(ret);
 		if (cached != NULL) {
 			if (conn_cache == NULL) {
 				conn_cache = calloc(1, sizeof(*conn_cache));
 				if (conn_cache == NULL || SSL_set_ex_data(ssl,
-				    ja4_conn_cache_ex_idx, conn_cache) != 1) {
+				    cache_idx, conn_cache) != 1) {
 					free(conn_cache);
 					free(cached);
 					return (ret);

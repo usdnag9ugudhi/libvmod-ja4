@@ -61,3 +61,28 @@ client c2 -connect ${tmpdir}/v1-http.sock {
 	txreq
 	rxresp
 } -run
+
+# Discarding the last VCL that imports the vmod makes Varnish dlclose()
+# it, so anything still registered with OpenSSL -- the ex_data callbacks
+# and the msg callback -- would be left pointing into unmapped memory.
+# Handshake again afterwards to catch it. See varnish/varnish#51.
+varnish v1 -vcl+backend {
+	import ja4;
+
+	sub vcl_deliver {
+		set resp.http.ja4 = ja4.ja4();
+	}
+}
+varnish v1 -cliok "vcl.discard vcl1"
+
+client c3 {
+	tls_config {
+		version = TLSv1.3
+		ciphersuites = "TLS_AES_128_GCM_SHA256"
+	}
+	tls_handshake
+	txreq
+	rxresp
+	expect resp.status == 200
+	expect resp.http.ja4 ~ "^t13[di][0-9]{2}[0-9]{2}[0-9a-zA-Z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$"
+} -run

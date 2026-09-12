@@ -12,7 +12,13 @@ implementations like Wireshark.
 
 The message callback is installed automatically on every `SSL_CTX` via
 an OpenSSL ex\_data `new_func` hook, so all connections -- including the
-very first one after startup -- are captured.
+very first one after startup -- are captured. It is uninstalled again
+when the last VCL importing the VMOD is discarded, since Varnish unloads
+the shared object at that point.
+
+Note that Varnish supports **JA3** natively via vmod-tls (set the
+`tls_ja3` parameter and call `tls.ja3()`), which may be sufficient if
+you do not specifically need JA4.
 
 ## Requirements
 
