@@ -12,9 +12,21 @@ implementations like Wireshark.
 
 The message callback is installed automatically on every `SSL_CTX` via
 an OpenSSL ex\_data `new_func` hook, so all connections -- including the
-very first one after startup -- are captured. It is uninstalled again
-when the last VCL importing the VMOD is discarded, since Varnish unloads
-the shared object at that point.
+very first one after startup -- are captured.
+
+OpenSSL copies the message callback into every connection, where it
+can't be unregistered, so the VMOD is linked with `-z nodelete` and stays
+in memory after the last VCL importing it is discarded. Until a VCL
+imports it again, the callback does nothing. This has some consequences:
+
+* The VMOD must be imported by the VCL that Varnish starts with. If it
+  is first imported later, Varnish has already created its TLS contexts,
+  and the `ja4.*()` functions return empty strings until a restart.
+* Discarding every VCL that imports it and importing it again later is
+  fine: fingerprints keep working.
+* Installing a new build of the VMOD takes effect only after a restart
+  of Varnish. Until then, the old copy's callback stays on the TLS
+  contexts and the new copy returns empty strings.
 
 Note that Varnish supports **JA3** natively via vmod-tls (set the
 `tls_ja3` parameter and call `tls.ja3()`), which may be sufficient if
@@ -28,7 +40,7 @@ To build this VMOD you will need:
 * a C compiler, e.g. GCC or clang
 * pkg-config
 * python3-docutils or docutils in macOS [1]
-* Varnish 7.5 or later from https://varnish.org/
+* Varnish Cache 9.1 or later from https://varnish.org/
 * libssl-dev in Debian/Ubuntu, openssl-devel in Fedora/RHEL.
   See also https://www.openssl.org/
 

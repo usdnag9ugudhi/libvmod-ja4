@@ -11,6 +11,12 @@
  *
  * Uses an SSL_CTX ex_data new_func callback so the msg callback is
  * installed automatically at SSL_CTX_new() time -- no timing issues.
+ *
+ * Nothing is ever unregistered.  SSL_new() copies the msg callback into
+ * every connection, where we can't reach it, so we are linked with
+ * -z nodelete (see Makefile.am) and Varnish's dlclose() leaves us
+ * mapped.  While no VCL imports us, ja4_armed is 0 and the callbacks
+ * do nothing.
  */
 
 #include "config.h"
@@ -26,20 +32,10 @@
 #include "vcl.h"
 #include "vcc_ja4_if.h"
 
-/* Varnish-internal (cache_client_ssl.c); keep in sync when upgrading. */
+/* Varnish-internal (tls/cache_tls.h); keep in sync when upgrading. */
 const SSL *VTLS_tls_ctx(const struct vrt_ctx *ctx);
 
-#ifndef SSL3_RT_HANDSHAKE
-#define SSL3_RT_HANDSHAKE 22
-#endif
-#ifndef SSL3_MT_CLIENT_HELLO
-#define SSL3_MT_CLIENT_HELLO 1
-#endif
-
-#define TLSEXT_TYPE_server_name            0
-#define TLSEXT_TYPE_signature_algorithms   13
-#define TLSEXT_TYPE_alpn                   16
-#define TLSEXT_TYPE_supported_versions     43
+#define TLSEXT_TYPE_alpn TLSEXT_TYPE_application_layer_protocol_negotiation
 
 #define IS_GREASE_TLS(x) \
 	((((x) & 0x0f0f) == 0x0a0a) && (((x) & 0xff) == (((x) >> 8) & 0xff)))
@@ -47,14 +43,39 @@ const SSL *VTLS_tls_ctx(const struct vrt_ctx *ctx);
 	(((c) >= '0' && (c) <= '9') || \
 	 ((c) >= 'A' && (c) <= 'Z') || \
 	 ((c) >= 'a' && (c) <= 'z'))
+#define BE16(p)    ((uint16_t)(p)[0] << 8 | (p)[1])
+#define HEX_LOW(x) ("0123456789abcdef"[(x) & 0xf])
+
 #define CLIENT_HELLO_MAX_LEN 16384
 #define RAW_MAX_CIPHERS   128
 #define RAW_MAX_EXTS       64
 #define RAW_MAX_SIG_ALGS   64
 #define RAW_MAX_ALPN       64
 
+/*
+ * Hex lists take 5 chars per value: 4 hex digits plus the ',' or '_'
+ * that separates it from the next.  Enough for all three lists joined.
+ */
+#define JA4_LIST_MAX (5 * (RAW_MAX_CIPHERS + RAW_MAX_EXTS + RAW_MAX_SIG_ALGS))
+/* Raw variants: "t13d1516h2_" + lists + NUL. */
+#define JA4_RAW_MAX  (11 + JA4_LIST_MAX)
+
+/* JA4 variant bits */
+#define JA4_SORTED   0x01u
+#define JA4_HASHED   0x02u
+#define JA4_MAIN     (JA4_SORTED | JA4_HASHED)
+#define JA4_R        (JA4_SORTED)
+#define JA4_O        (JA4_HASHED)
+#define JA4_RO       0u
+
+#define JA4_HASH_LEN    12
+#define JA4_HASH_BUF    13
+#define JA4_ZERO_HASH   "000000000000"
+#define JA4_CAP(x) ((x) > 99 ? 99 : (unsigned)(x))
+
 /* --- Parsed Client Hello stored per connection --- */
 struct ja4_parsed {
+	char		*cached[4];	/* result per variant; atomic, write-once */
 	uint16_t	tls_version;
 	uint8_t		has_sni;
 	uint8_t		nciphers;
@@ -66,168 +87,78 @@ struct ja4_parsed {
 };
 
 /* --- OpenSSL ex_data and automatic callback installation --- */
-/* ja4_mtx guards everything below. */
+/*
+ * ja4_mtx guards the writes in vmod_event().  The indexes are allocated
+ * once, before ja4_armed is first set, and never change after that.
+ */
 static pthread_mutex_t ja4_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int ja4_ssl_ex_idx = -1;
-static int ja4_conn_cache_ex_idx = -1;
 static int ja4_ctx_ex_idx = -1;
 static unsigned ja4_vcl_refs;
-static unsigned ja4_armed;
+static unsigned ja4_armed;	/* atomic */
 
-struct ja4_ctx_ref {
-	SSL_CTX				*ctx;
-	VTAILQ_ENTRY(ja4_ctx_ref)	 list;
-};
-static VTAILQ_HEAD(, ja4_ctx_ref) ja4_ctxs = VTAILQ_HEAD_INITIALIZER(ja4_ctxs);
+static void
+ja4_parsed_free(struct ja4_parsed *parsed)
+{
+	unsigned i;
 
-static void ja4_msg_cb(int, int, int, const void *, size_t, SSL *, void *);
+	if (parsed == NULL)
+		return;
+	for (i = 0; i < 4; i++)
+		free(parsed->cached[i]);
+	free(parsed);
+}
 
 static void
 ja4_ex_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
     int idx, long argl, void *argp)
 {
 	(void)parent; (void)ad; (void)idx; (void)argl; (void)argp;
-	free(ptr);
+	ja4_parsed_free(ptr);
 }
-
-struct ja4_conn_cache {
-	unsigned	 computed;
-	const char	*ptr[4];
-};
-
-static void
-ja4_conn_cache_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
-    int idx, long argl, void *argp)
-{
-	struct ja4_conn_cache *conn_cache;
-	unsigned i;
-
-	(void)parent; (void)ad; (void)idx; (void)argl; (void)argp;
-	conn_cache = ptr;
-	if (conn_cache == NULL)
-		return;
-	for (i = 0; i < 4; i++) {
-		if ((conn_cache->computed & (1u << i)) != 0 &&
-		    conn_cache->ptr[i] != NULL)
-			free((void *)conn_cache->ptr[i]);
-	}
-	free(conn_cache);
-}
-
-/*
- * Called by OpenSSL each time SSL_CTX_new() creates a context.
- * Installs our msg callback before any handshake can occur, and
- * remembers the context so we can uninstall it again at unload.
- */
-static void
-ja4_ctx_new_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
-    int idx, long argl, void *argp)
-{
-	struct ja4_ctx_ref *ref;
-
-	(void)ptr; (void)ad; (void)idx; (void)argl; (void)argp;
-
-	ref = malloc(sizeof(*ref));
-	if (ref == NULL)
-		return;
-	ref->ctx = parent;
-
-	AZ(pthread_mutex_lock(&ja4_mtx));
-	if (ja4_armed) {
-		SSL_CTX_set_msg_callback(parent, ja4_msg_cb);
-		VTAILQ_INSERT_TAIL(&ja4_ctxs, ref, list);
-		ref = NULL;
-	}
-	AZ(pthread_mutex_unlock(&ja4_mtx));
-	free(ref);
-}
-
-/* Called from SSL_CTX_free(), so we never keep a freed SSL_CTX. */
-static void
-ja4_ctx_free_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
-    int idx, long argl, void *argp)
-{
-	struct ja4_ctx_ref *ref;
-
-	(void)ptr; (void)ad; (void)idx; (void)argl; (void)argp;
-
-	AZ(pthread_mutex_lock(&ja4_mtx));
-	VTAILQ_FOREACH(ref, &ja4_ctxs, list) {
-		if (ref->ctx == parent) {
-			VTAILQ_REMOVE(&ja4_ctxs, ref, list);
-			break;
-		}
-	}
-	AZ(pthread_mutex_unlock(&ja4_mtx));
-	free(ref);
-}
-
-/* Caller holds ja4_mtx. */
-static void
-ja4_global_init(void)
-{
-	ja4_ssl_ex_idx = SSL_get_ex_new_index(0, NULL,
-	    NULL, NULL, ja4_ex_free_cb);
-	ja4_conn_cache_ex_idx = SSL_get_ex_new_index(0, NULL,
-	    NULL, NULL, ja4_conn_cache_free_cb);
-	ja4_ctx_ex_idx = SSL_CTX_get_ex_new_index(0, NULL,
-	    ja4_ctx_new_cb, NULL, ja4_ctx_free_cb);
-	ja4_armed = 1;
-}
-
-/*
- * Unregister everything before Varnish dlclose()s us.
- * Caller holds ja4_mtx.
- */
-static void
-ja4_global_fini(void)
-{
-	struct ja4_ctx_ref *ref, *tmp;
-
-	ja4_armed = 0;
-
-	VTAILQ_FOREACH_SAFE(ref, &ja4_ctxs, list, tmp) {
-		SSL_CTX_set_msg_callback(ref->ctx, NULL);
-		VTAILQ_REMOVE(&ja4_ctxs, ref, list);
-		free(ref);
-	}
-
-	if (ja4_ssl_ex_idx >= 0) {
-		(void)CRYPTO_free_ex_index(CRYPTO_EX_INDEX_SSL,
-		    ja4_ssl_ex_idx);
-		ja4_ssl_ex_idx = -1;
-	}
-	if (ja4_conn_cache_ex_idx >= 0) {
-		(void)CRYPTO_free_ex_index(CRYPTO_EX_INDEX_SSL,
-		    ja4_conn_cache_ex_idx);
-		ja4_conn_cache_ex_idx = -1;
-	}
-	if (ja4_ctx_ex_idx >= 0) {
-		(void)CRYPTO_free_ex_index(CRYPTO_EX_INDEX_SSL_CTX,
-		    ja4_ctx_ex_idx);
-		ja4_ctx_ex_idx = -1;
-	}
-}
-
-#define BE16(p)    ((uint16_t)(p)[0] << 8 | (p)[1])
-#define HEX_LOW(x) ("0123456789abcdef"[(x) & 0xf])
-#define JA4_ZERO_HASH "000000000000"
 
 /* --- Client Hello parser (msg callback) --- */
+
+/* Skip a vector with a 1-byte length prefix at *off. */
+static int
+skip_vec8(const unsigned char *p, size_t len, size_t *off)
+{
+	if (*off >= len || (size_t)p[*off] > len - *off - 1)
+		return (-1);
+	*off += 1 + (size_t)p[*off];
+	return (0);
+}
+
 static void
 ja4_msg_cb(int write_p, int version, int content_type,
     const void *buf, size_t len, SSL *ssl, void *arg)
 {
 	const unsigned char *p = buf;
-	size_t body_len;
-	unsigned armed;
+	struct ja4_parsed *parsed, *old;
+	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
+	uint16_t sigs[RAW_MAX_SIG_ALGS];
+	unsigned nciphers = 0, nexts = 0, nsigs = 0;
+	uint16_t tls_version;
+	int has_sni = 0;
+	char alpn_first = '0', alpn_last = '0';
+	size_t body_len, off, cslen, ext_end, i;
 
 	(void)version; (void)arg;
 
-	AZ(pthread_mutex_lock(&ja4_mtx));
-	armed = ja4_armed;
-	AZ(pthread_mutex_unlock(&ja4_mtx));
-	if (!armed)
+	/*
+	 * Once the server writes anything past ServerHello (or
+	 * HelloRetryRequest, which is one too), no more Client Hellos can
+	 * come, so stop OpenSSL calling us for every record for the rest
+	 * of the connection.  We run on the thread driving this SSL, so
+	 * this doesn't race.
+	 */
+	if (write_p != 0 && content_type == SSL3_RT_HANDSHAKE &&
+	    len >= 1 && p[0] != SSL3_MT_SERVER_HELLO) {
+		SSL_set_msg_callback(ssl, NULL);
+		return;
+	}
+
+	if (!__atomic_load_n(&ja4_armed, __ATOMIC_ACQUIRE))
 		return;
 
 	if (write_p != 0 || content_type != SSL3_RT_HANDSHAKE ||
@@ -239,31 +170,17 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	    len < 4 + body_len || body_len < 2 + 32 + 1)
 		return;
 
-	{
-	struct ja4_parsed *parsed;
-	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
-	uint16_t sigs[RAW_MAX_SIG_ALGS];
-	unsigned nciphers, nexts, nsigs;
-	uint16_t legacy_version, tls_version;
-	int has_sni;
-	char alpn_first, alpn_last;
-	size_t off, cslen, ext_len, ext_end, i;
-
-	off = 4;
-	legacy_version = BE16(p + off);
-	off += 2 + 32;
-
-	if (off >= len) return;
-	if ((size_t)p[off] > len - off - 1)
+	tls_version = BE16(p + 4);		/* legacy_version */
+	off = 4 + 2 + 32;
+	if (skip_vec8(p, len, &off))		/* session id */
 		return;
-	off += 1 + (size_t)p[off];
 
-	if (off + 2 > len) return;
-	cslen = BE16(p + off); off += 2;
+	if (off + 2 > len)
+		return;
+	cslen = BE16(p + off);
+	off += 2;
 	if (off + cslen > len)
 		return;
-
-	nciphers = 0;
 	for (i = 0; i + 2 <= cslen; i += 2) {
 		uint16_t c = BE16(p + off + i);
 		if (!IS_GREASE_TLS(c) && nciphers < RAW_MAX_CIPHERS)
@@ -271,21 +188,15 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	}
 	off += cslen;
 
-	if (off >= len) return;
-	if ((size_t)p[off] > len - off - 1)
+	if (skip_vec8(p, len, &off))		/* compression methods */
 		return;
-	off += 1 + (size_t)p[off];
 
-	if (off + 2 > len) return;
-	ext_len = BE16(p + off); off += 2;
-	ext_end = off + ext_len;
+	if (off + 2 > len)
+		return;
+	ext_end = off + 2 + BE16(p + off);
+	off += 2;
 	if (ext_end > len)
 		return;
-
-	has_sni = 0;
-	nexts = nsigs = 0;
-	alpn_first = alpn_last = '0';
-	tls_version = legacy_version;
 
 	while (off + 4 <= ext_end) {
 		uint16_t etype = BE16(p + off);
@@ -342,7 +253,7 @@ ja4_msg_cb(int write_p, int version, int content_type,
 		off += elen;
 	}
 
-	parsed = malloc(sizeof(*parsed) +
+	parsed = calloc(1, sizeof(*parsed) +
 	    ((size_t)nciphers + nexts + nsigs) * sizeof(uint16_t));
 	if (parsed == NULL)
 		return;
@@ -357,30 +268,51 @@ ja4_msg_cb(int write_p, int version, int content_type,
 	memcpy(parsed->data + nciphers, exts, nexts * sizeof(uint16_t));
 	memcpy(parsed->data + nciphers + nexts, sigs,
 	    nsigs * sizeof(uint16_t));
-	AZ(pthread_mutex_lock(&ja4_mtx));
-	if (ja4_armed) {
-		free(SSL_get_ex_data(ssl, ja4_ssl_ex_idx));
-		SSL_set_ex_data(ssl, ja4_ssl_ex_idx, parsed);
-		parsed = NULL;
-	}
-	AZ(pthread_mutex_unlock(&ja4_mtx));
-	free(parsed);
-	memset(ciphers, 0, sizeof(ciphers));
-	memset(exts, 0, sizeof(exts));
-	memset(sigs, 0, sizeof(sigs));
-	}
+
+	/* After a HelloRetryRequest, the second Client Hello wins. */
+	old = SSL_get_ex_data(ssl, ja4_ssl_ex_idx);
+	if (SSL_set_ex_data(ssl, ja4_ssl_ex_idx, parsed))
+		ja4_parsed_free(old);
+	else
+		ja4_parsed_free(parsed);
 }
 
-/* --- JA4 variant bits and per-connection cache --- */
-#define JA4_SORTED   0x01u
-#define JA4_HASHED   0x02u
-#define JA4_MAIN     (JA4_SORTED | JA4_HASHED)
-#define JA4_R        (JA4_SORTED)
-#define JA4_O        (JA4_HASHED)
-#define JA4_RO       0u
-#define JA4_HASH_LEN    12
-#define JA4_HASH_BUF    13
-#define JA4_CAP(x) ((x) > 99 ? 99 : (unsigned)(x))
+/*
+ * Called by OpenSSL each time SSL_CTX_new() creates a context.
+ * Installs our msg callback before any handshake can occur.
+ */
+static void
+ja4_ctx_new_cb(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+    int idx, long argl, void *argp)
+{
+	(void)ptr; (void)ad; (void)idx; (void)argl; (void)argp;
+	SSL_CTX_set_msg_callback(parent, ja4_msg_cb);
+}
+
+/* --- VCL event handler --- */
+int
+vmod_event(VRT_CTX, struct vmod_priv *priv, enum vcl_event_e e)
+{
+	(void)ctx; (void)priv;
+
+	AZ(pthread_mutex_lock(&ja4_mtx));
+	if (e == VCL_EVENT_LOAD && ja4_vcl_refs++ == 0) {
+		/* Already allocated if we were imported before. */
+		if (ja4_ssl_ex_idx < 0)
+			ja4_ssl_ex_idx = SSL_get_ex_new_index(0, NULL,
+			    NULL, NULL, ja4_ex_free_cb);
+		if (ja4_ctx_ex_idx < 0)
+			ja4_ctx_ex_idx = SSL_CTX_get_ex_new_index(0, NULL,
+			    ja4_ctx_new_cb, NULL, NULL);
+		__atomic_store_n(&ja4_armed, 1, __ATOMIC_RELEASE);
+	} else if (e == VCL_EVENT_DISCARD) {
+		assert(ja4_vcl_refs > 0);
+		if (--ja4_vcl_refs == 0)
+			__atomic_store_n(&ja4_armed, 0, __ATOMIC_RELEASE);
+	}
+	AZ(pthread_mutex_unlock(&ja4_mtx));
+	return (0);
+}
 
 /* --- JA4 helpers --- */
 static int
@@ -410,14 +342,12 @@ hex_list(char *buf, size_t sz, size_t off,
 /*
  * SHA-256 of one or two comma-separated hex-uint16 lists joined
  * by underscore, truncated to 12 hex chars.
- * Max hex size: 5*na + (nb ? 1 + 5*nb : 0) - 1; na,nb <= 128 => 1281.
  */
-#define JA4_HEXLIST_MAX (5 * 128 + 1 + 5 * 128)
 static void
 ja4_hash_lists(const uint16_t *a, unsigned na,
     const uint16_t *b, unsigned nb, char out[JA4_HASH_BUF])
 {
-	char tmp[JA4_HEXLIST_MAX];
+	char tmp[JA4_LIST_MAX];
 	size_t off;
 	unsigned char digest[32];
 	unsigned i;
@@ -426,11 +356,11 @@ ja4_hash_lists(const uint16_t *a, unsigned na,
 		memcpy(out, JA4_ZERO_HASH, JA4_HASH_BUF);
 		return;
 	}
-	off = hex_list(tmp, JA4_HEXLIST_MAX, 0, a, na);
+	off = hex_list(tmp, JA4_LIST_MAX, 0, a, na);
 	if (nb > 0) {
-		if (na > 0 && off < JA4_HEXLIST_MAX)
+		if (na > 0 && off < JA4_LIST_MAX)
 			tmp[off++] = '_';
-		off = hex_list(tmp, JA4_HEXLIST_MAX, off, b, nb);
+		off = hex_list(tmp, JA4_LIST_MAX, off, b, nb);
 	}
 	if (EVP_Digest(tmp, off, digest, NULL, EVP_sha256(), NULL) != 1) {
 		memcpy(out, JA4_ZERO_HASH, JA4_HASH_BUF);
@@ -441,40 +371,19 @@ ja4_hash_lists(const uint16_t *a, unsigned na,
 		out[2 * i + 1] = HEX_LOW(digest[i]);
 	}
 	out[JA4_HASH_LEN] = '\0';
-	memset(tmp, 0, sizeof(tmp));
-	memset(digest, 0, sizeof(digest));
-}
-
-/* --- VCL event handler --- */
-int
-vmod_event(VRT_CTX, struct vmod_priv *priv, enum vcl_event_e e)
-{
-	(void)ctx; (void)priv;
-
-	if (e == VCL_EVENT_LOAD) {
-		AZ(pthread_mutex_lock(&ja4_mtx));
-		if (ja4_vcl_refs++ == 0)
-			ja4_global_init();
-		AZ(pthread_mutex_unlock(&ja4_mtx));
-	} else if (e == VCL_EVENT_DISCARD) {
-		AZ(pthread_mutex_lock(&ja4_mtx));
-		assert(ja4_vcl_refs > 0);
-		if (--ja4_vcl_refs == 0)
-			ja4_global_fini();
-		AZ(pthread_mutex_unlock(&ja4_mtx));
-	}
-	return (0);
 }
 
 /* --- JA4 computation --- */
 static VCL_STRING
 ja4_compute(VRT_CTX, unsigned variant)
 {
-	struct ja4_conn_cache *conn_cache;
-	SSL *ssl;
 	struct ja4_parsed *parsed;
-	const char *ret = NULL;
-	int ssl_idx, cache_idx;
+	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
+	const uint16_t *pexts, *sigs;
+	unsigned nciphers, nexts, nsigs, ext_total, i;
+	char part_a[16], *dup, *expected;
+	const char *ret, *cached, *ver;
+	SSL *ssl;
 
 	assert(variant < 4);
 
@@ -482,63 +391,44 @@ ja4_compute(VRT_CTX, unsigned variant)
 	if (ssl == NULL)
 		return (NULL);
 
-	AZ(pthread_mutex_lock(&ja4_mtx));
-	ssl_idx = ja4_armed ? ja4_ssl_ex_idx : -1;
-	cache_idx = ja4_armed ? ja4_conn_cache_ex_idx : -1;
-	AZ(pthread_mutex_unlock(&ja4_mtx));
-
-	if (ssl_idx < 0) {
+	/* Set in VCL_EVENT_LOAD, before any VCL importing us runs. */
+	if (ja4_ssl_ex_idx < 0) {
 		VSLb(ctx->vsl, SLT_Debug, "ja4: ex_data not allocated");
 		return (NULL);
 	}
-	parsed = SSL_get_ex_data(ssl, ssl_idx);
+	parsed = SSL_get_ex_data(ssl, ja4_ssl_ex_idx);
 	if (parsed == NULL)
 		return (NULL);
 
-	/* Return cached result for this connection if already computed. */
-	if (cache_idx >= 0) {
-		conn_cache = SSL_get_ex_data(ssl, cache_idx);
-		if (conn_cache != NULL &&
-		    (conn_cache->computed & (1u << variant)) &&
-		    conn_cache->ptr[variant] != NULL)
-			return (WS_Printf(ctx->ws, "%s",
-			    conn_cache->ptr[variant]));
-	}
+	/*
+	 * Results are cached per connection: callers typically ask on
+	 * every request, and HTTP/2 streams may ask concurrently.
+	 */
+	cached = __atomic_load_n(&parsed->cached[variant], __ATOMIC_ACQUIRE);
+	if (cached != NULL)
+		return (WS_Copy(ctx->ws, cached, -1));
 
-	{
-	int do_sort = (variant & JA4_SORTED) != 0;
-	int do_hash = (variant & JA4_HASHED) != 0;
-	uint16_t ciphers[RAW_MAX_CIPHERS], exts[RAW_MAX_EXTS];
-	const uint16_t *pexts, *sigs;
-	unsigned nciphers, nexts, nsigs, ext_total, i;
-	const char *ver;
-	char part_a[16];
-
-	/* Clamp counts from parsed so we never overflow local buffers or
-	 * read past parsed->data (e.g. if ex_data was corrupted). */
+	/* ja4_msg_cb() caps these, so they always fit our buffers. */
 	nciphers = parsed->nciphers;
-	if (nciphers > RAW_MAX_CIPHERS)
-		nciphers = RAW_MAX_CIPHERS;
 	ext_total = parsed->nexts;
-	if (ext_total > RAW_MAX_EXTS)
-		ext_total = RAW_MAX_EXTS;
 	nsigs = parsed->nsigs;
-	if (nsigs > RAW_MAX_SIG_ALGS)
-		nsigs = RAW_MAX_SIG_ALGS;
+	assert(nciphers <= RAW_MAX_CIPHERS);
+	assert(ext_total <= RAW_MAX_EXTS);
+	assert(nsigs <= RAW_MAX_SIG_ALGS);
 
 	memcpy(ciphers, parsed->data, nciphers * sizeof(uint16_t));
-
 	pexts = parsed->data + nciphers;
+	sigs = pexts + ext_total;
+
+	/* Sorted variants leave SNI and ALPN out of the extension list. */
 	nexts = 0;
 	for (i = 0; i < ext_total; i++) {
-		if (do_sort && (pexts[i] == TLSEXT_TYPE_server_name ||
+		if ((variant & JA4_SORTED) &&
+		    (pexts[i] == TLSEXT_TYPE_server_name ||
 		    pexts[i] == TLSEXT_TYPE_alpn))
 			continue;
-		if (nexts < RAW_MAX_EXTS)
-			exts[nexts++] = pexts[i];
+		exts[nexts++] = pexts[i];
 	}
-
-	sigs = parsed->data + nciphers + ext_total;
 
 	switch (parsed->tls_version) {
 	case 0x0304: ver = "13"; break;
@@ -558,24 +448,18 @@ ja4_compute(VRT_CTX, unsigned variant)
 	    JA4_CAP(nciphers), JA4_CAP(ext_total),
 	    parsed->alpn_first, parsed->alpn_last);
 
-	if (do_sort) {
-		if (nciphers > 1)
-			qsort(ciphers, nciphers, sizeof(uint16_t),
-			    cmp_uint16);
-		if (nexts > 1)
-			qsort(exts, nexts, sizeof(uint16_t), cmp_uint16);
+	if (variant & JA4_SORTED) {
+		qsort(ciphers, nciphers, sizeof(uint16_t), cmp_uint16);
+		qsort(exts, nexts, sizeof(uint16_t), cmp_uint16);
 	}
 
-	if (do_hash) {
+	if (variant & JA4_HASHED) {
 		char ch[JA4_HASH_BUF], eh[JA4_HASH_BUF];
 		ja4_hash_lists(ciphers, nciphers, NULL, 0, ch);
 		ja4_hash_lists(exts, nexts, sigs, nsigs, eh);
 		ret = WS_Printf(ctx->ws, "%s_%s_%s", part_a, ch, eh);
-		memset(ch, 0, sizeof(ch));
-		memset(eh, 0, sizeof(eh));
 	} else {
-		/* part_a + "_" + hex(ciphers) + "_" + hex(exts) + "_" + hex(sigs) < 1300 */
-		char buf[1536];
+		char buf[JA4_RAW_MAX];
 		size_t off = (size_t)snprintf(buf, sizeof(buf),
 		    "%s_", part_a);
 		off = hex_list(buf, sizeof(buf), off, ciphers, nciphers);
@@ -587,40 +471,20 @@ ja4_compute(VRT_CTX, unsigned variant)
 			off = hex_list(buf, sizeof(buf), off, sigs, nsigs);
 		}
 		buf[off] = '\0';
-		ret = WS_Printf(ctx->ws, "%s", buf);
-		memset(buf, 0, sizeof(buf));
+		ret = WS_Copy(ctx->ws, buf, -1);
 	}
-	if (ret == NULL)
+	if (ret == NULL) {
 		VSLb(ctx->vsl, SLT_Debug, "ja4: workspace overflow");
-
-	memset(ciphers, 0, sizeof(ciphers));
-	memset(exts, 0, sizeof(exts));
-	memset(part_a, 0, sizeof(part_a));
-
-	/* Store in connection-level cache for reuse on same TLS connection. */
-	if (cache_idx >= 0 && ret != NULL) {
-		char *cached;
-
-		conn_cache = SSL_get_ex_data(ssl, cache_idx);
-		cached = strdup(ret);
-		if (cached != NULL) {
-			if (conn_cache == NULL) {
-				conn_cache = calloc(1, sizeof(*conn_cache));
-				if (conn_cache == NULL || SSL_set_ex_data(ssl,
-				    cache_idx, conn_cache) != 1) {
-					free(conn_cache);
-					free(cached);
-					return (ret);
-				}
-			}
-			if (conn_cache->ptr[variant] != NULL)
-				free((void *)conn_cache->ptr[variant]);
-			conn_cache->ptr[variant] = cached;
-			conn_cache->computed |= (1u << variant);
-		}
-	}
+		return (NULL);
 	}
 
+	/* First writer wins; a cached result is never replaced. */
+	dup = strdup(ret);
+	expected = NULL;
+	if (dup != NULL && !__atomic_compare_exchange_n(
+	    &parsed->cached[variant], &expected, dup, 0,
+	    __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+		free(dup);
 	return (ret);
 }
 

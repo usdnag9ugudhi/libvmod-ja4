@@ -1,0 +1,108 @@
+vtest "Unload the vmod with TLS connections open, then import it again"
+
+# OpenSSL copies our msg callback into every connection, so the vmod
+# must stay mapped after Varnish unloads it.  See varnish/varnish#51.
+
+feature tls_1_3
+
+shell {
+cat >vtls.cfg <<EOF
+  frontend = {
+      host = "*"
+      port = "0"
+  }
+
+  pem-file = "${testdir}/../etc/example.com.pem"
+  tls-protos = TLSv1.3
+EOF
+}
+
+vcache v1 \
+	-arg "-A ${tmpdir}/vtls.cfg" \
+	-arg "-p vcl_cooldown=1" \
+	-vcl {
+	import ja4;
+	backend be none;
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+	sub vcl_synth {
+		set resp.http.ja4 = ja4.ja4();
+	}
+} -start
+
+barrier b1 cond 2
+barrier b2 cond 2
+
+# Handshakes while the vmod is loaded, and stays open across the unload.
+client c1 {
+	tls_config {
+		version = TLSv1.3
+	}
+	tls_handshake
+	txreq
+	rxresp
+	expect resp.http.ja4 ~ "^t13"
+	barrier b1 sync
+	barrier b2 sync
+	txreq
+	rxresp
+	expect resp.status == 200
+} -start
+
+barrier b1 sync
+
+# Switch to a VCL without ja4 and discard the one with it.  Once no
+# worker holds vcl1 any more, Varnish runs the discard event and
+# dlclose()s the vmod.
+vcache v1 -vcl {
+	backend be none;
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+}
+vcache v1 -cliok "vcl.discard vcl1"
+vcache v1 -expect n_vcl_discard == 0
+vcache v1 -expect vmods == 0
+
+# The old connection still carries our callback.
+barrier b2 sync
+client c1 -wait
+
+# New connections get our callback from the SSL_CTX; it must be inert.
+client c2 {
+	tls_config {
+		version = TLSv1.3
+	}
+	tls_handshake
+	txreq
+	rxresp
+	expect resp.status == 200
+} -run
+
+# Importing it again finds the same copy, still hooked into the SSL_CTX.
+vcache v1 -vcl {
+	import ja4;
+	backend be none;
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+	sub vcl_synth {
+		set resp.http.ja4 = ja4.ja4();
+	}
+}
+
+client c3 {
+	tls_config {
+		version = TLSv1.3
+	}
+	tls_handshake
+	txreq
+	rxresp
+	expect resp.http.ja4 ~ "^t13[di][0-9]{2}[0-9]{2}[0-9a-zA-Z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$"
+} -run
+
+vcache v1 -expect vmods == 1

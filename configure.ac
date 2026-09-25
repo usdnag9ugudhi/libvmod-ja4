@@ -1,5 +1,5 @@
 AC_PREREQ([2.69])
-AC_INIT([libvmod-ja4], [1.0.1])
+AC_INIT([libvmod-ja4], [1.1.0])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_HEADERS([config.h])
@@ -10,8 +10,8 @@ AM_SILENT_RULES([yes])
 AC_ARG_VAR([RST2MAN], [the program to build manuals from reStructuredText])
 AC_CHECK_PROGS([RST2MAN], [rst2man rst2man.py])
 
-VARNISH_PREREQ([7.5.0])
-VARNISH_VMODS([ja4])
+VCACHE_REQUIRE([[varnish], [9.1.0]])
+VCACHE_VMODS([ja4])
 
 # OpenSSL (libssl for Client Hello APIs, libcrypto for SHA-256)
 AC_CHECK_HEADER([openssl/ssl.h], [], [AC_MSG_ERROR([openssl/ssl.h not found - install libssl-dev or openssl-devel])])
@@ -36,7 +36,7 @@ AC_OUTPUT
 AS_ECHO("
 	==== $PACKAGE_STRING ====
 
-	varnish:      $VARNISH_VERSION
+	varnish:      $VCACHE_VERSION
 	prefix:       $prefix
 	vmoddir:      $vmoddir
 	vcldir:       $vcldir

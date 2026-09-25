@@ -1,4 +1,4 @@
-varnishtest "Test vmod-ja4 JA4 fingerprint"
+vtest "Test vmod-ja4 JA4 fingerprint"
 
 feature tls_1_3
 
@@ -21,7 +21,7 @@ server s1 {
 
 # TLS frontend (-A) plus plain HTTP listener so the same v1 can serve
 # both TLS client c1 and plain HTTP client c2 (no_tls) against backend s1.
-varnish v1 \
+vcache v1 \
 	-arg "-A ${tmpdir}/vtls.cfg" \
 	-arg "-a http=${tmpdir}/v1-http.sock,HTTP" \
 	-vcl+backend {
@@ -62,18 +62,16 @@ client c2 -connect ${tmpdir}/v1-http.sock {
 	rxresp
 } -run
 
-# Discarding the last VCL that imports the vmod makes Varnish dlclose()
-# it, so anything still registered with OpenSSL -- the ex_data callbacks
-# and the msg callback -- would be left pointing into unmapped memory.
-# Handshake again afterwards to catch it. See varnish/varnish#51.
-varnish v1 -vcl+backend {
+# Discard one of two VCLs importing the vmod: it stays armed.  See
+# unload.vtc for discarding the last one.
+vcache v1 -vcl+backend {
 	import ja4;
 
 	sub vcl_deliver {
 		set resp.http.ja4 = ja4.ja4();
 	}
 }
-varnish v1 -cliok "vcl.discard vcl1"
+vcache v1 -cliok "vcl.discard vcl1"
 
 client c3 {
 	tls_config {

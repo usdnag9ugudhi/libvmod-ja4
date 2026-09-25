@@ -13,7 +13,7 @@ License:	Unlicense
 URL:		https://github.com/usdnag9ugudhi/libvmod-ja4
 Source:		%{name}-%{version}.tar.gz
 
-BuildRequires:	pkgconfig(varnishapi) >= 7.5.0
+BuildRequires:	pkgconfig(varnishapi) >= 9.1.0
 BuildRequires:	openssl-devel
 
 %description
@@ -40,6 +40,29 @@ rm -f %{buildroot}%{vmoddir}/*.la
 %{vmoddir}/libvmod_ja4.so
 
 %changelog
+* Thu Sep 24 2026 libvmod-ja4 maintainers - 1.1.0-1
+- Require Varnish Cache 9.1.0; migrate the build to the VCACHE macros
+  and vtest
+- Fix a crash when the last VCL importing ja4 is discarded while TLS
+  connections are open or handshaking (the rest of varnish/varnish#51):
+  OpenSSL copies the msg callback into each connection, so link with
+  -z nodelete and keep the vmod mapped; the discard event now only
+  disarms it, so fingerprints also keep working when ja4 is imported
+  again later
+- Stop OpenSSL calling the msg callback for every record once the
+  Client Hello phase is over
+- Fix a race in the per-connection result cache when HTTP/2 streams on
+  the same connection call ja4 concurrently, which could leak or use
+  freed memory
+- Serve cached results without locking: repeat calls on a connection
+  now cost ~20 ns at any thread count, instead of contending on a
+  global mutex (~14 us per call at 56 threads)
+- Take the global mutex once per Client Hello instead of on every TLS
+  message seen by the OpenSSL msg callback
+- Simplify the code: keep cached results with the parsed Client Hello
+  instead of a second ex_data index, drop stack-buffer scrubbing and
+  unreachable clamps, and size scratch buffers from the parser limits
+
 * Sat Sep 12 2026 libvmod-ja4 maintainers - 1.0.1-1
 - Unregister OpenSSL callbacks on the last vcl.discard, fixing a
   crash after VCL reload (varnish/varnish#51)

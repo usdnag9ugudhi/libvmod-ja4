@@ -25,9 +25,21 @@ is called.  Because certificate contexts are created after the index is
 registered, all Client Hello messages are captured -- including the very
 first connection and any contexts created by later certificate rotation.
 
-When the last VCL importing it is discarded, the VMOD unregisters those
-callbacks again.  Varnish unloads the shared object at that point, so
-anything left registered with OpenSSL would dangle.
+OpenSSL copies the msg callback into every connection, where it can't
+be unregistered, so the VMOD is linked with ``-z nodelete`` and stays in
+memory after the last VCL importing it is discarded.  Until a VCL imports
+it again, the callbacks do nothing.  As a result:
+
+* The VMOD must be imported by the VCL that Varnish starts with.  If it
+  is first imported later, Varnish has already created its TLS contexts,
+  and all functions return empty strings until a restart.
+
+* Discarding every VCL that imports it and importing it again later is
+  fine: fingerprints keep working.
+
+* Installing a new build of the VMOD takes effect only after a restart
+  of Varnish.  Until then, the old copy's callback stays on the TLS
+  contexts and the new copy returns empty strings.
 
 Algorithm reference:
 https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
