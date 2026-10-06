@@ -1,4 +1,4 @@
-vtest "Test vmod-ja4 JA4 fingerprint"
+varnishtest "Test vmod-ja4 JA4 fingerprint"
 
 feature tls_1_3
 
@@ -21,7 +21,8 @@ server s1 {
 
 # TLS frontend (-A) plus plain HTTP listener so the same v1 can serve
 # both TLS client c1 and plain HTTP client c2 (no_tls) against backend s1.
-vcache v1 \
+# ${v1_sock} is the -a listener; the -A TLS frontend is ${v1_a0_sock}.
+varnish v1 \
 	-arg "-A ${tmpdir}/vtls.cfg" \
 	-arg "-a http=${tmpdir}/v1-http.sock,HTTP" \
 	-vcl+backend {
@@ -41,7 +42,7 @@ vcache v1 \
 # JA4 variants: ja4 (hashed sorted), ja4_r (raw sorted),
 #               ja4_o (hashed original), ja4_ro (raw original)
 # Spec: https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
-client c1 {
+client c1 -connect ${v1_a0_sock} {
 	tls_config {
 		version = TLSv1.3
 		ciphersuites = "TLS_AES_128_GCM_SHA256"
@@ -64,16 +65,16 @@ client c2 -connect ${tmpdir}/v1-http.sock {
 
 # Discard one of two VCLs importing the vmod: it stays armed.  See
 # unload.vtc for discarding the last one.
-vcache v1 -vcl+backend {
+varnish v1 -vcl+backend {
 	import ja4;
 
 	sub vcl_deliver {
 		set resp.http.ja4 = ja4.ja4();
 	}
 }
-vcache v1 -cliok "vcl.discard vcl1"
+varnish v1 -cliok "vcl.discard vcl1"
 
-client c3 {
+client c3 -connect ${v1_a0_sock} {
 	tls_config {
 		version = TLSv1.3
 		ciphersuites = "TLS_AES_128_GCM_SHA256"

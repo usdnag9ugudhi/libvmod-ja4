@@ -17,7 +17,8 @@ To build this VMOD you will need:
 * a C compiler, e.g. GCC or clang
 * pkg-config
 * python3-docutils or docutils in macOS [1]
-* Varnish Cache 9.1 or later from https://varnish.org/
+* Varnish Enterprise 6.0 with in-process TLS (`varnish-plus-dev`).
+  For Varnish Cache 9.1 or later, use the `main` branch.
 * libssl-dev in Debian/Ubuntu, openssl-devel in Fedora/RHEL.
   See also https://www.openssl.org/
 
@@ -33,6 +34,13 @@ You will also need to set `PKG_CONFIG_PATH` to the directory where
 
 ```
 export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+```
+
+`make check` needs a Varnish Enterprise license with TLS listen sockets
+(`tls-client`). varnishtest reads it from `VARNISH_LICENSE`:
+
+```
+VARNISH_LICENSE=/etc/varnish/varnish-enterprise.lic make check
 ```
 
 ## Installation

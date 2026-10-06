@@ -5,12 +5,10 @@ set -u
 
 ROOT_DIR=$(dirname "$0")
 
-VCACHEAPI_DATAROOTDIR=$(pkg-config --variable=datarootdir varnishapi 2>/dev/null ||
-    pkg-config --variable=datarootdir vinylapi 2>/dev/null) || {
-	pkg-config --exists --print-errors varnishapi
-	exit 1
-}
-export VCACHEAPI_DATAROOTDIR
+pkg-config --exists --print-errors varnishapi
+
+VARNISHAPI_DATAROOTDIR=$(pkg-config --variable=datarootdir varnishapi)
+export VARNISHAPI_DATAROOTDIR
 
 mkdir -p m4
 autoreconf -i "$ROOT_DIR"

@@ -1,8 +1,7 @@
 %global __debug_package	0
 %global __strip	true
 
-%global vmoddir	%{_libdir}/varnish/vmods
-%global vcldir	%{_datadir}/varnish/vcl
+%global vmoddir	%(pkg-config --variable=vmoddir varnishapi)
 
 Name:		@PACKAGE@
 Version:	@PACKAGE_VERSION@
@@ -13,7 +12,7 @@ License:	Unlicense
 URL:		https://github.com/usdnag9ugudhi/libvmod-ja4
 Source:		%{name}-%{version}.tar.gz
 
-BuildRequires:	pkgconfig(varnishapi) >= 9.1.0
+BuildRequires:	pkgconfig(varnishapi) >= 6.0.0
 BuildRequires:	openssl-devel
 
 %description
@@ -40,9 +39,10 @@ rm -f %{buildroot}%{vmoddir}/*.la
 %{vmoddir}/libvmod_ja4.so
 
 %changelog
-* Thu Sep 24 2026 libvmod-ja4 maintainers - 1.1.0-1
-- Require Varnish Cache 9.1.0; migrate the build to the VCACHE macros
-  and vtest
+* Tue Oct 06 2026 libvmod-ja4 maintainers - 1.1.0-1
+- Backport to Varnish Enterprise 6.0 (branch 6.0): build with the
+  VARNISH autoconf macros and varnishtest, use the VTLS_tls_ctx()
+  prototype from cache/cache.h
 - Fix a crash when the last VCL importing ja4 is discarded while TLS
   connections are open or handshaking (the rest of varnish/varnish#51):
   OpenSSL copies the msg callback into each connection, so link with

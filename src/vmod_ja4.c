@@ -7,7 +7,8 @@
  *
  * Parses raw Client Hello wire bytes via OpenSSL msg callback,
  * not OpenSSL's parsed representation (which drops unknown exts).
- * Requires Varnish with client-side TLS exporting VTLS_tls_ctx().
+ * Requires Varnish Enterprise 6.0 with in-process TLS, which declares
+ * VTLS_tls_ctx() in cache/cache.h.
  *
  * Uses an SSL_CTX ex_data new_func callback so the msg callback is
  * installed automatically at SSL_CTX_new() time -- no timing issues.
@@ -31,9 +32,6 @@
 #include "cache/cache.h"
 #include "vcl.h"
 #include "vcc_ja4_if.h"
-
-/* Varnish-internal (tls/cache_tls.h); keep in sync when upgrading. */
-const SSL *VTLS_tls_ctx(const struct vrt_ctx *ctx);
 
 #define TLSEXT_TYPE_alpn TLSEXT_TYPE_application_layer_protocol_negotiation
 

@@ -1,4 +1,4 @@
-vtest "Unload the vmod with TLS connections open, then import it again"
+varnishtest "Unload the vmod with TLS connections open, then import it again"
 
 # OpenSSL copies our msg callback into every connection, so the vmod
 # must stay mapped after Varnish unloads it.  See varnish/varnish#51.
@@ -17,12 +17,12 @@ cat >vtls.cfg <<EOF
 EOF
 }
 
-vcache v1 \
+varnish v1 \
 	-arg "-A ${tmpdir}/vtls.cfg" \
 	-arg "-p vcl_cooldown=1" \
 	-vcl {
 	import ja4;
-	backend be none;
+	backend be { .host = "${bad_ip}"; .port = "9080"; }
 
 	sub vcl_recv {
 		return (synth(200));
@@ -56,16 +56,16 @@ barrier b1 sync
 # Switch to a VCL without ja4 and discard the one with it.  Once no
 # worker holds vcl1 any more, Varnish runs the discard event and
 # dlclose()s the vmod.
-vcache v1 -vcl {
-	backend be none;
+varnish v1 -vcl {
+	backend be { .host = "${bad_ip}"; .port = "9080"; }
 
 	sub vcl_recv {
 		return (synth(200));
 	}
 }
-vcache v1 -cliok "vcl.discard vcl1"
-vcache v1 -expect n_vcl_discard == 0
-vcache v1 -expect vmods == 0
+varnish v1 -cliok "vcl.discard vcl1"
+varnish v1 -expect n_vcl_discard == 0
+varnish v1 -expect vmods == 0
 
 # The old connection still carries our callback.
 barrier b2 sync
@@ -83,9 +83,9 @@ client c2 {
 } -run
 
 # Importing it again finds the same copy, still hooked into the SSL_CTX.
-vcache v1 -vcl {
+varnish v1 -vcl {
 	import ja4;
-	backend be none;
+	backend be { .host = "${bad_ip}"; .port = "9080"; }
 
 	sub vcl_recv {
 		return (synth(200));
@@ -105,4 +105,4 @@ client c3 {
 	expect resp.http.ja4 ~ "^t13[di][0-9]{2}[0-9]{2}[0-9a-zA-Z]{2}_[0-9a-f]{12}_[0-9a-f]{12}$"
 } -run
 
-vcache v1 -expect vmods == 1
+varnish v1 -expect vmods == 1
