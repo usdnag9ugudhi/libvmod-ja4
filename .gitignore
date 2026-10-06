@@ -48,3 +48,7 @@ rpmbuild/
 *.spec
 
 vmod_vcs_version.txt
+
+# Varnish Enterprise license
+
+*.lic

@@ -16,7 +16,7 @@ truncated to 12 hex chars) vs raw (comma-separated hex).
 All functions can only be used in client context (e.g. ``vcl_recv``,
 ``vcl_deliver``).
 
-Requires Varnish built with client-side TLS that exports ``VTLS_tls_ctx()``.
+Requires Varnish Enterprise 6.0 with in-process TLS (``-A``).
 
 When the first VCL importing it is loaded, the VMOD registers an OpenSSL
 ``SSL_CTX`` ex_data index whose ``new_func`` callback installs
@@ -58,7 +58,7 @@ EXAMPLE
 API
 ===
 
-$Event event
+$Event vmod_event
 $Function STRING ja4()
 $Restrict client
 

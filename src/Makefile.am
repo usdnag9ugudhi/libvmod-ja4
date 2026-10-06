@@ -1,4 +1,4 @@
-AM_CFLAGS = $(VCACHEAPI_CFLAGS)
+AM_CFLAGS = $(VARNISHAPI_CFLAGS)
 
 # Modules
 
@@ -23,13 +23,13 @@ DISTCLEANFILES = vmod_vcs_version.txt
 # Test suite
 
 AM_TESTS_ENVIRONMENT = \
-	PATH="$(abs_builddir):$(VCACHE_TEST_PATH):$(PATH)" \
-	LD_LIBRARY_PATH="$(VCACHE_LIBRARY_PATH)"
+	PATH="$(abs_builddir):$(VARNISH_TEST_PATH):$(PATH)" \
+	LD_LIBRARY_PATH="$(VARNISH_LIBRARY_PATH)"
 TEST_EXTENSIONS = .vtc
-VTC_LOG_COMPILER = vtest -v -E$(VTESTEXT)
+VTC_LOG_COMPILER = varnishtest -v
 AM_VTC_LOG_FLAGS = \
-	-p vcl_path="$(abs_top_srcdir)/vcl:$(VCACHEAPI_VCLDIR)" \
-	-p vmod_path="$(abs_builddir)/.libs:$(vmoddir):$(VCACHEAPI_VMODDIR)"
+	-p vcl_path="$(abs_top_srcdir)/vcl:$(VARNISHAPI_VCLDIR)" \
+	-p vmod_path="$(abs_builddir)/.libs:$(vmoddir):$(VARNISHAPI_VMODDIR)"
 
 TESTS = \
 	vtc/vmod_ja4.vtc \
