@@ -58,7 +58,7 @@ EXAMPLE
 API
 ===
 
-$Event vmod_event
+$Event event
 $Function STRING ja4()
 $Restrict client
 

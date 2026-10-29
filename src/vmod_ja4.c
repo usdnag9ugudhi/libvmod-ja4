@@ -33,6 +33,14 @@
 #include "vcl.h"
 #include "vcc_ja4_if.h"
 
+/*
+ * "$Event event": vmodtool in 6.0.18r7+ prefixes the name (VPFX), older
+ * releases emit it verbatim and don't define VPFX.
+ */
+#ifndef VPFX
+#define vmod_event event
+#endif
+
 #define TLSEXT_TYPE_alpn TLSEXT_TYPE_application_layer_protocol_negotiation
 
 #define IS_GREASE_TLS(x) \
